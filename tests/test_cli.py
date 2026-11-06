@@ -92,7 +92,8 @@ class TestCLI(unittest.TestCase):
         res = self._run_cli("serve", self.db_path, input_data=input_stream)
         self.assertEqual(res.returncode, 0)
         lines = res.stdout.strip().splitlines()
-        self.assertEqual(lines, ["ACK 101", "ACK 102", "ACK 103"])
+        self.assertEqual(lines[0], "READY")
+        self.assertEqual(lines[1:], ["ACK 101", "ACK 102", "ACK 103"])
 
         # Check DB state
         res = self._run_cli("get", self.db_path, "subject")
@@ -103,4 +104,3 @@ class TestCLI(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

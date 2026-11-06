@@ -1,0 +1,50 @@
+flowchart TD
+    subgraph ClientLayer["Client & Concurrency Layer"]
+        CLI["CLI (kvdb.py / cli.py)"]
+        Torture["Torture Tool / Child Process (serve mode)"]
+        Writers["2+ Concurrent Threads / Processes"]
+    end
+
+    subgraph SyncPrimitives["Synchronization & Safety Guards"]
+        TLock["threading.RLock (In-Process Concurrency)"]
+        FLock["msvcrt.locking / fcntl.flock (Cross-Process Companion Lock: <path>.lock)"]
+        MaxBytesGuard["Disk-Full Pre-Check (check_max_bytes_or_raise)"]
+    end
+
+    subgraph MemoryLayer["In-Memory State"]
+        MemIndex["self.index: Dict[bytes, Tuple[int, int]]\n{key -> (value_file_offset, value_len)}"]
+    end
+
+    subgraph EngineCore["KVDatabase Engine (db.py)"]
+        Recovery["_recover(): Sub-second Chunked Scanner"]
+        BatchWriter["batch(): Atomic Transaction Assembler"]
+        Compactor["compact(): Crash-Safe Copy-on-Write"]
+    end
+
+    subgraph OnDiskLayout["Authoritative On-Disk File Layout (<path>.kv)"]
+        FileHeader["16-Byte File Header:\n[magic: 8B b'KVDB0001'][version: 4B u32 = 1][reserved: 4B u32 = 0]"]
+        DataRecord["Record Framing (Little-Endian):\n[rec_len u32 (4B)][type u8 (1B)][txid u64 (8B)][klen u16 (2B)][vlen u32 (4B)][key bytes][value bytes][crc32 u32 (4B)]"]
+        CommitRecord["Commit Marker Record:\n[rec_len=23 u32][type=3 u8][txid u64][klen=0 u16][vlen=0 u32][crc32 u32]"]
+    end
+
+    subgraph CompactionTemp["Compaction Scratch (<path>.compact)"]
+        TempFile["1. Write File Header\n2. Stream active keys from self.index\n3. Append COMMIT marker\n4. fsync(temp_fd)\n5. Close handles -> os.replace()"]
+    end
+
+    CLI --> TLock
+    Torture --> TLock
+    Writers --> TLock
+    TLock --> FLock
+    FLock --> MaxBytesGuard
+
+    MaxBytesGuard --> BatchWriter
+    BatchWriter -->|"1. write(payload_records + commit_marker)"| OnDiskLayout
+    BatchWriter -->|"2. os.fsync(file.fileno())"| OnDiskLayout
+    BatchWriter -->|"3. Update in-memory index"| MemIndex
+
+    Recovery -->|"Reads chunks via memoryview cursor"| OnDiskLayout
+    Recovery -->|"Discards torn tail; truncates to last valid COMMIT"| OnDiskLayout
+    Recovery -->|"Populates confirmed keys"| MemIndex
+
+    Compactor --> TempFile
+    TempFile -->|"Atomic replace on Windows/POSIX"| OnDiskLayout
