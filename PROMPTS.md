@@ -143,3 +143,13 @@ REMOVE/DELETE unnessary or useless files
 ```
 Continue
 ```
+
+---
+
+### Prompt 7
+*Tool:* Gemini 3.8 Flash  
+*Approximate Time:* Hour 15 (Local time: 2026-11-07 01:43 IST)
+
+```
+so how to check output'
+```
