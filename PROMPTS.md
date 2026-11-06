@@ -258,3 +258,13 @@ Include recovery time at 1,000,000 keys as NOT VERIFIED unless you measure it.
 
 Finish by listing any place where the code and the PDF disagree.
 ```
+
+---
+
+### Prompt 12
+*Tool:* Gemini 3.8 Flash  
+*Approximate Time:* Hour 15 (Local time: 2026-11-07 02:26 IST)
+
+```
+Continue
+```
