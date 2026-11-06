@@ -81,7 +81,7 @@ def check_max_bytes_or_raise(file_obj, bytes_to_add: int, max_bytes: int):
     Must be called BEFORE any write occurs.
     Raises DiskFullError if limit would be breached.
     """
-    if max_bytes is None:
+    if max_bytes is None or max_bytes <= 0:
         return
 
     file_obj.seek(0, os.SEEK_END)
@@ -97,17 +97,19 @@ def check_max_bytes_or_raise(file_obj, bytes_to_add: int, max_bytes: int):
 def sync_directory_if_posix(file_path: str):
     """
     On POSIX systems, fsyncs the parent directory after rename.
-    On Windows (NTFS), directory fsync is not supported by the OS and is a no-op;
+    On Windows (nt), directory fsync is not supported by the OS and is a no-op;
     Windows NTFS guarantees atomic metadata update during os.replace.
     """
     if os.name != "nt":
         dir_path = os.path.dirname(os.path.abspath(file_path)) or "."
         try:
-            dfd = os.open(dir_path, os.O_RDONLY)
+            flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            dfd = os.open(dir_path, flags)
             try:
                 os.fsync(dfd)
             finally:
                 os.close(dfd)
         except OSError:
             pass
-

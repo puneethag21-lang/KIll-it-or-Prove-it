@@ -268,3 +268,63 @@ Finish by listing any place where the code and the PDF disagree.
 ```
 Continue
 ```
+
+---
+
+### Prompt 13
+*Tool:* Gemini 3.8 Flash  
+*Approximate Time:* Hour 15 (Local time: 2026-11-07 02:30 IST)
+
+```
+We need to resolve all 6 gaps identified in "PART 3 — Gap List & Disagreements with the Synterra PDF" to ensure full compliance with the hackathon specification and avoid point deductions. Implement the following changes across the repository:
+
+1. CLI Argument & Output Exact Compliance (`src/cli.py`):
+   - Add `--max-bytes` argument (type=int, default=0) to the `serve` subcommand parser:
+     `serve_parser.add_argument("--max-bytes", type=int, default=0, help="Maximum database file size in bytes")`
+     Pass `max_bytes=args.max_bytes` into `KVDB.open(path, max_bytes=args.max_bytes)`.
+   - Fix `check` command output:
+     The PDF strictly specifies printing "OK" or a reason. Change any output like "OK: <count> keys" to strictly:
+     `print("OK")` on success, or `print(reason)` on failure.
+   - Fix `open` command output:
+     Format as: `print(f"OK keys={key_count} recovery_time={recovery_time:.2f}s")`.
+
+2. Recovery Speed Optimization (< 2.0s for 1M Keys in `src/engine.py` / `src/storage.py`):
+   - Benchmark currently takes 3.8584s, which exceeds the 2.0s limit.
+   - Refactor the recovery scanner loop:
+     * Use `mmap.mmap(fd, 0, access=mmap.ACCESS_READ)` wrapped in a `memoryview` for zero-copy buffer slicing instead of repeated `read()` or seeking.
+     * Pre-instantiate struct unpackers at module level (e.g. `RECORD_HDR_STRUCT = struct.Struct(">BQQHI")`) and use `RECORD_HDR_STRUCT.unpack_from(view, offset)`.
+     * Store entries directly into a primitive dictionary `keydir[key] = (offset, val_len, seq)` without instantiating custom Python class objects.
+     * Ensure slicing operations minimize temporary byte allocations during sequential replay.
+
+3. Torture Tool `large-batch` Coverage (`torture/runner.py`):
+   - In `mode == "large-batch"`, update batch generation to test up to 10,000 operations per batch as mandated by Scenario B6 (e.g., `random.randint(2000, 10000)` ops per batch), rather than only 50–200 ops.
+   - Verify that incomplete 10k batches killed halfway are completely dropped by the oracle and engine upon recovery.
+
+4. Torture Tool `disk-full` Kill Injection (`torture/runner.py`):
+   - Complete `mode == "disk-full"` to satisfy Scenario E3:
+     * Start `serve` with a tight `--max-bytes` cap (e.g., 64KB or 256KB).
+     * Fire writes concurrently until `DiskFullError` errors are observed.
+     * Inject random `kill -9` while writes are failing under the cap.
+     * Restart, run `check`, and verify with `IndependentOracle` that previously acknowledged data remains intact with zero corruption.
+
+5. Cross-Platform Directory Fsync (`src/storage.py` / `src/compaction.py`):
+   - Wrap the parent directory fsync during compaction swap with an OS check:
+     ```python
+     if os.name != "nt":
+         try:
+             dir_fd = os.open(dir_path, os.O_DIRECTORY | os.O_RDONLY)
+             try:
+                 os.fsync(dir_fd)
+             finally:
+                 os.close(dir_fd)
+         except OSError:
+             pass
+     ```
+   - On Windows (`nt`), rely cleanly on atomic `os.replace` (`MoveFileExW` / `ReplaceFileW`). This keeps the engine operational on Windows development machines while guaranteeing strict POSIX directory durability on Linux.
+
+6. Update `ARCHITECTURE.md` and `BREAKING.md`:
+   - Ensure the 32-scenario table in `ARCHITECTURE.md` references the updated functions and modes.
+   - In `BREAKING.md`, confirm the crash points and recovery descriptions match the refactored `mmap` recovery scanner and compaction swap flow.
+
+Run the test suite and torture tool after implementing these changes to verify that all 6 gaps are fully closed.
+```

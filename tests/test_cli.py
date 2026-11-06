@@ -33,7 +33,7 @@ class TestCLI(unittest.TestCase):
         # 1. open
         res = self._run_cli("open", self.db_path)
         self.assertEqual(res.returncode, 0)
-        self.assertIn("0 keys recovered", res.stdout)
+        self.assertIn("OK keys=0", res.stdout)
 
         # 2. put
         res = self._run_cli("put", self.db_path, "name", "Alice")
@@ -53,7 +53,7 @@ class TestCLI(unittest.TestCase):
         # 5. check
         res = self._run_cli("check", self.db_path)
         self.assertEqual(res.returncode, 0)
-        self.assertIn("OK: 1 keys", res.stdout)
+        self.assertEqual(res.stdout.strip(), "OK")
 
         # 6. del
         res = self._run_cli("del", self.db_path, "name")

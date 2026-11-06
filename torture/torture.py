@@ -28,6 +28,8 @@ class IndependentOracle:
         self.acked_state: Dict[bytes, Optional[bytes]] = {}
         # In-flight operations for current run: op_id -> (op_type, details)
         self.in_flight: Dict[str, Tuple[str, list]] = {}
+        # Errored operations for current run: op_id -> (op_type, details)
+        self.errored_ops: Dict[str, Tuple[str, list]] = {}
         # History of all valid values ever seen for each key
         self.known_values_per_key: Dict[bytes, Set[bytes]] = {}
 
@@ -65,15 +67,22 @@ class IndependentOracle:
                     else:
                         self.acked_state[k] = v
 
+    def record_error(self, op_id: str):
+        with self.lock:
+            if op_id in self.in_flight:
+                op_type, details = self.in_flight.pop(op_id)
+                self.errored_ops[op_id] = (op_type, details)
+
     def resolve_after_pass(self, dumped_state: Dict[bytes, bytes]):
         """
         After verify_against_dump PASSES for an iteration, resolve state:
         set acked_state to exactly the dump contents, clear in_flight,
-        keep known_values_per_key intact.
+        clear errored_ops, keep known_values_per_key intact.
         """
         with self.lock:
             self.acked_state = dict(dumped_state)
             self.in_flight.clear()
+            self.errored_ops.clear()
 
     def verify_against_dump(self, dumped_state: Dict[bytes, bytes]) -> Tuple[bool, str]:
         """
@@ -134,10 +143,37 @@ class IndependentOracle:
 
             # 3. Check batch all-or-nothing for in-flight batches
             for op_id, (op_type, details) in self.in_flight.items():
-                if op_type == "batch" and len(details) > 1:
-                    applied = [dumped_state.get(k) == v for k, v in details]
-                    if any(applied) and not all(applied):
-                        pass
+                if op_type == "batch" and len(details) > 0:
+                    final_batch_ops: Dict[bytes, Optional[bytes]] = {}
+                    for item in details:
+                        k, v = item[0], item[1]
+                        final_batch_ops[k] = v
+
+                    matched_keys = []
+                    for k, expected_v in final_batch_ops.items():
+                        found_v = dumped_state.get(k)
+                        if expected_v is not None:
+                            if found_v == expected_v:
+                                matched_keys.append(k)
+                        else:
+                            if found_v is None and self.acked_state.get(k) is not None:
+                                matched_keys.append(k)
+
+                    total_final = len(final_batch_ops)
+                    matched_count = len(matched_keys)
+
+                    if 0 < matched_count < total_final:
+                        return False, (
+                            f"partial batch {op_id}: found {matched_count}/{total_final} keys "
+                            f"(found sample: {matched_keys[:5]}, missing sample: {[k for k in final_batch_ops if k not in matched_keys][:5]})"
+                        )
+
+            # 4. Check errored ops: no errored operation may be visible in dump
+            for op_id, (op_type, details) in self.errored_ops.items():
+                for item in details:
+                    k, v = item[0], item[1]
+                    if v is not None and dumped_state.get(k) == v:
+                        return False, f"Errored op {op_id} produced visible state in dump for key {k}: {v}"
 
             return True, "OK"
 
@@ -148,7 +184,10 @@ class TortureRunner:
         self.iterations = iterations
         self.seed = seed if seed is not None else random.randint(1, 999999)
         self.mode = mode
-        self.max_bytes = max_bytes
+        if self.mode == "disk-full" and (max_bytes is None or max_bytes <= 0):
+            self.max_bytes = 200000
+        else:
+            self.max_bytes = max_bytes
         self.rng = random.Random(self.seed)
 
         self.db_path = os.path.abspath("torture_test.kv")
@@ -174,6 +213,8 @@ class TortureRunner:
     def run_iteration(self, iter_num: int, oracle: IndependentOracle) -> Tuple[bool, str]:
         cli_script = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "kvdb.py"))
         cmd = [sys.executable, cli_script, "serve", self.db_path]
+        if self.max_bytes is not None and self.max_bytes > 0:
+            cmd.extend(["--max-bytes", str(self.max_bytes)])
 
         proc = subprocess.Popen(
             cmd,
@@ -193,11 +234,12 @@ class TortureRunner:
         stop_workers = threading.Event()
         stdin_lock = threading.Lock()
         acks_count = 0
-        acks_lock = threading.Lock()
+        errors_count = 0
+        stats_lock = threading.Lock()
 
-        # Reader thread listening for ACKs - drains stdout completely until EOF
+        # Reader thread listening for ACKs and ERRs - drains stdout completely until EOF
         def ack_listener():
-            nonlocal acks_count
+            nonlocal acks_count, errors_count
             while True:
                 line = proc.stdout.readline()
                 if not line:
@@ -208,8 +250,15 @@ class TortureRunner:
                     if len(parts) >= 2:
                         op_id = parts[1]
                         oracle.record_ack(op_id)
-                        with acks_lock:
+                        with stats_lock:
                             acks_count += 1
+                elif line_str.startswith("ERR"):
+                    parts = line_str.split()
+                    if len(parts) >= 2:
+                        op_id = parts[1]
+                        oracle.record_error(op_id)
+                        with stats_lock:
+                            errors_count += 1
 
         listener_thread = threading.Thread(target=ack_listener, daemon=True)
         listener_thread.start()
@@ -234,15 +283,23 @@ class TortureRunner:
 
                 elif self.mode == "large-batch":
                     batch_ops = []
+                    batch_size = w_rng.randint(2000, 10000)
                     msg_parts = [f"{op_id} batch "]
-                    for b_idx in range(w_rng.randint(50, 200)):
+                    for b_idx in range(batch_size):
                         b_val_id = self.next_val_id()
-                        bk = f"bk_{worker_id}_{b_idx}".encode()
-                        bv = f"bv_it{iter_num}_w{worker_id}_c{b_val_id}".encode()
+                        bk = f"bk_{op_id}_{b_idx}".encode()
+                        bv = f"bv_{op_id}_{b_val_id}".encode()
                         batch_ops.append((bk, bv))
                         msg_parts.append(f"put {bk.decode()} {bv.decode()};")
                     oracle.register_in_flight(op_id, "batch", batch_ops)
-                    msg = "".join(msg_parts).encode() + b"\n"
+                    msg = "".join(msg_parts).rstrip(";").encode() + b"\n"
+
+                elif self.mode == "disk-full":
+                    k = f"k_df_{worker_id}_{w_rng.randint(1, 40)}".encode()
+                    v_payload = "x" * 400
+                    v = f"v_df_it{iter_num}_w{worker_id}_c{val_id}_{v_payload}".encode()
+                    oracle.register_in_flight(op_id, "put", [(k, v)])
+                    msg = f"{op_id} put {k.decode()} {v.decode()}\n".encode()
 
                 elif self.mode == "compaction":
                     if w_rng.random() < 0.25:
@@ -288,8 +345,17 @@ class TortureRunner:
         w2.start()
 
         # Random millisecond kill delay while writers are actively running
-        kill_delay = self.rng.uniform(0.020, 0.060)
-        time.sleep(kill_delay)
+        if self.mode == "disk-full":
+            t_df_wait = time.time()
+            while time.time() - t_df_wait < 0.25:
+                with stats_lock:
+                    if errors_count > 0:
+                        break
+                time.sleep(0.002)
+            time.sleep(self.rng.uniform(0.005, 0.020))
+        else:
+            kill_delay = self.rng.uniform(0.020, 0.060)
+            time.sleep(kill_delay)
 
         # UNANNOUNCED KILL - TerminateProcess immediately (kill -9)
         stop_workers.set()
@@ -344,10 +410,66 @@ class TortureRunner:
                     pass
             dumped_state[k] = v
 
+        if self.mode == "disk-full":
+            if acks_count == 0 and errors_count == 0:
+                return False, f"Vacuous pass: zero ACKs and zero error replies in disk-full mode (iter {iter_num})"
+
         passed, reason = oracle.verify_against_dump(dumped_state)
         if passed:
             # Step 1b: Resolve upon pass
             oracle.resolve_after_pass(dumped_state)
+
+            if self.mode == "disk-full" and dumped_state:
+                # (4) after deleting keys and running compact, writes succeed again
+                keys_to_del = list(dumped_state.keys())[:max(1, len(dumped_state) // 2)]
+                for dk in keys_to_del:
+                    subprocess.run(
+                        [sys.executable, cli_script, "del", self.db_path, dk.decode()],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                compact_res = subprocess.run(
+                    [sys.executable, cli_script, "compact", self.db_path],
+                    capture_output=True, text=True
+                )
+                if compact_res.returncode != 0:
+                    return False, f"Compaction failed after deletes in disk-full mode: {compact_res.stderr.strip()}"
+
+                resume_k = f"res_k_{iter_num}"
+                resume_v = f"res_v_{iter_num}"
+                with oracle.lock:
+                    oracle.known_values_per_key.setdefault(resume_k.encode(), set()).add(resume_v.encode())
+
+                put_res = subprocess.run(
+                    [sys.executable, cli_script, "put", self.db_path, resume_k, resume_v],
+                    capture_output=True, text=True
+                )
+                if put_res.returncode != 0:
+                    return False, f"Write failed after delete+compact under max-bytes: {put_res.stderr.strip()}"
+
+                get_res = subprocess.run(
+                    [sys.executable, cli_script, "get", self.db_path, resume_k],
+                    capture_output=True, text=True
+                )
+                if get_res.returncode != 0 or get_res.stdout.strip() != resume_v:
+                    return False, f"Get failed after resume write: {get_res.stdout.strip()}"
+
+                # Clean up test resume key
+                subprocess.run(
+                    [sys.executable, cli_script, "del", self.db_path, resume_k],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+
+                new_dump = subprocess.run(
+                    [sys.executable, cli_script, "dump", self.db_path],
+                    capture_output=True
+                )
+                new_state = {}
+                for line in new_dump.stdout.splitlines():
+                    line = line.strip()
+                    if line:
+                        parts = line.split(b" ", 1)
+                        new_state[parts[0]] = parts[1] if len(parts) > 1 else b""
+                oracle.resolve_after_pass(new_state)
         # On failure, do not resolve; report the failure
 
         return passed, reason

@@ -3,6 +3,7 @@ Core KVDatabase Engine implementation for Synterra's 'Kill It and Prove It'.
 """
 
 import os
+import mmap
 import struct
 import zlib
 import threading
@@ -73,9 +74,9 @@ class KVDatabase:
 
     def _recover(self):
         """
-        Sub-second, crash-safe recovery:
+        Sub-second, crash-safe zero-copy recovery using memoryview and mmap:
         1. Validate 16-byte header.
-        2. Stream through log using zero-copy buffered memoryview cursor.
+        2. Stream through log using mmap memoryview cursor on isolated read handle.
         3. Buffer pending transaction ops per txid.
         4. Apply ops to self.index ONLY when valid COMMIT is parsed.
         5. Truncate file cleanly to the end of the LAST VALID COMMIT.
@@ -98,101 +99,69 @@ class KVDatabase:
         if not is_valid_file_header(hdr):
             raise CorruptedDatabaseError("Invalid database file header (magic or version mismatch)")
 
-        # pending: txid -> list of (op_type, key_bytes, val_offset, val_len)
-        pending: Dict[int, List[Tuple[int, bytes, int, int]]] = {}
+        if total_size == FILE_HEADER_SIZE:
+            return
+
+        # Pre-bind unpackers and crc functions for tight loop performance
+        unpack_hdr = RECORD_HEADER_STRUCT.unpack_from
+        unpack_crc = CRC_STRUCT.unpack_from
+        calc_crc = zlib.crc32
+
         last_commit_end = FILE_HEADER_SIZE
+        pending: Dict[int, list] = {}
 
-        CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB read chunks for fast IO
-        buf = bytearray()
-        buf_file_start = FILE_HEADER_SIZE
-        cursor = 0
+        # Open dedicated read handle for mmap so self.file is never mapped directly on Windows
+        with open(self.path, "rb") as read_f:
+            mm = mmap.mmap(read_f.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                view = memoryview(mm)
+                pos = FILE_HEADER_SIZE
 
-        self.file.seek(FILE_HEADER_SIZE)
-
-        while True:
-            # Maintain sufficient bytes ahead of cursor
-            remaining_in_buf = len(buf) - cursor
-            if remaining_in_buf < RECORD_HEADER_SIZE:
-                # Periodic shift to reclaim buffer memory
-                if cursor > 0:
-                    del buf[:cursor]
-                    buf_file_start += cursor
-                    cursor = 0
-                chunk = self.file.read(CHUNK_SIZE)
-                if chunk:
-                    buf.extend(chunk)
-                if len(buf) - cursor < RECORD_HEADER_SIZE:
-                    # Incomplete header at EOF -> stop recovery
-                    break
-
-            # Fast header inspection directly on bytearray
-            rec_len, rec_type, txid, klen, vlen = RECORD_HEADER_STRUCT.unpack_from(buf, cursor)
-
-            # Sanity check on rec_len
-            expected_min = RECORD_HEADER_SIZE + CRC_SIZE
-            if rec_len < expected_min or rec_len > (RECORD_HEADER_SIZE + MAX_KEY_LEN + MAX_VALUE_LEN + CRC_SIZE):
-                break
-
-            if rec_len != RECORD_HEADER_SIZE + klen + vlen + CRC_SIZE:
-                break
-
-            # Ensure complete record is in buffer
-            if len(buf) - cursor < rec_len:
-                if cursor > 0:
-                    del buf[:cursor]
-                    buf_file_start += cursor
-                    cursor = 0
-                while len(buf) < rec_len:
-                    chunk = self.file.read(max(CHUNK_SIZE, rec_len - len(buf)))
-                    if not chunk:
+                while pos + 23 <= total_size:
+                    rec_len, rec_type, txid, klen, vlen = unpack_hdr(view, pos)
+                    if pos + rec_len > total_size:
                         break
-                    buf.extend(chunk)
 
-                if len(buf) < rec_len:
-                    # Premature EOF -> torn record, stop recovery
-                    break
+                    expected_len = RECORD_HEADER_SIZE + klen + vlen + CRC_SIZE
+                    if rec_len != expected_len:
+                        break
 
-            # Validate semantics
-            if rec_type not in (TYPE_PUT, TYPE_DELETE, TYPE_COMMIT):
-                break
-            if rec_type == TYPE_COMMIT and (klen != 0 or vlen != 0):
-                break
-            if rec_type == TYPE_DELETE and (not (MIN_KEY_LEN <= klen <= MAX_KEY_LEN) or vlen != 0):
-                break
-            if rec_type == TYPE_PUT and (not (MIN_KEY_LEN <= klen <= MAX_KEY_LEN) or vlen > MAX_VALUE_LEN):
-                break
+                    if rec_type not in (TYPE_PUT, TYPE_DELETE, TYPE_COMMIT):
+                        break
+                    if rec_type == TYPE_COMMIT and (klen != 0 or vlen != 0):
+                        break
+                    if rec_type == TYPE_DELETE and (not (MIN_KEY_LEN <= klen <= MAX_KEY_LEN) or vlen != 0):
+                        break
+                    if rec_type == TYPE_PUT and (not (MIN_KEY_LEN <= klen <= MAX_KEY_LEN) or vlen > MAX_VALUE_LEN):
+                        break
 
-            # Fast CRC check using temporary slice
-            rec_start = cursor
-            body_end = rec_start + rec_len - CRC_SIZE
-            expected_crc = zlib.crc32(memoryview(buf)[rec_start:body_end]) & 0xffffffff
-            actual_crc = CRC_STRUCT.unpack_from(buf, body_end)[0]
+                    # Fast CRC check over all bytes before CRC
+                    body_end = pos + rec_len - CRC_SIZE
+                    if (calc_crc(view[pos:body_end]) & 0xffffffff) != unpack_crc(view, body_end)[0]:
+                        break
 
-            if expected_crc != actual_crc:
-                # CRC mismatch -> corrupted / torn tail, stop recovery
-                break
+                    if rec_type == TYPE_COMMIT:
+                        acts = pending.pop(txid, None)
+                        if acts:
+                            for rpos, rklen, rvlen, rtype in acts:
+                                k = bytes(view[rpos + RECORD_HEADER_SIZE : rpos + RECORD_HEADER_SIZE + rklen])
+                                if rtype == TYPE_PUT:
+                                    self.index[k] = (rpos + RECORD_HEADER_SIZE + rklen, rvlen)
+                                else:
+                                    self.index.pop(k, None)
+                        last_commit_end = pos + rec_len
 
-            record_file_offset = buf_file_start + rec_start
+                    else:  # TYPE_PUT or TYPE_DELETE
+                        entry = (pos, klen, vlen, rec_type)
+                        try:
+                            pending[txid].append(entry)
+                        except KeyError:
+                            pending[txid] = [entry]
 
-            if rec_type == TYPE_COMMIT:
-                actions = pending.pop(txid, [])
-                for action, a_key, a_val_off, a_val_len in actions:
-                    if action == TYPE_PUT:
-                        self.index[a_key] = (a_val_off, a_val_len)
-                    elif action == TYPE_DELETE:
-                        self.index.pop(a_key, None)
-                last_commit_end = record_file_offset + rec_len
-
-            elif rec_type == TYPE_PUT:
-                key_bytes = bytes(buf[rec_start + RECORD_HEADER_SIZE : rec_start + RECORD_HEADER_SIZE + klen])
-                val_offset = record_file_offset + RECORD_HEADER_SIZE + klen
-                pending.setdefault(txid, []).append((TYPE_PUT, key_bytes, val_offset, vlen))
-
-            elif rec_type == TYPE_DELETE:
-                key_bytes = bytes(buf[rec_start + RECORD_HEADER_SIZE : rec_start + RECORD_HEADER_SIZE + klen])
-                pending.setdefault(txid, []).append((TYPE_DELETE, key_bytes, 0, 0))
-
-            cursor += rec_len
+                    pos += rec_len
+            finally:
+                view.release()
+                mm.close()
 
         # Truncate uncommitted/torn trailing records back to last valid COMMIT
         if total_size != last_commit_end:

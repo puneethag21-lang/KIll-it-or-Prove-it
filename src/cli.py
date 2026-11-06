@@ -8,7 +8,7 @@ import sys
 import os
 import time
 import argparse
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from src.db import KVDatabase
 from src.errors import KVDBError, DiskFullError, CorruptedDatabaseError
@@ -41,7 +41,7 @@ def parse_batch_file(filepath: str) -> List[Tuple[str, str, str]]:
     return ops
 
 
-def run_serve(db_path: str):
+def run_serve(db_path: str, max_bytes: Optional[int] = None):
     """
     Long-running serve mode: reads operations from stdin and prints ACK after fsync.
     Lines accepted:
@@ -51,7 +51,7 @@ def run_serve(db_path: str):
       put <key> <value>
       del <key>
     """
-    db = KVDatabase(db_path)
+    db = KVDatabase(db_path, max_bytes=max_bytes)
     try:
         # Signal readiness to supervisor
         sys.stdout.write("READY\n")
@@ -126,8 +126,12 @@ def run_serve(db_path: str):
                 sys.stdout.flush()
 
             except Exception as e:
-                sys.stderr.write(f"ERROR: {e}\n")
+                # Output error line to stdout and stderr so caller can detect
+                err_msg = f"ERROR: {e}\n"
+                sys.stderr.write(err_msg)
                 sys.stderr.flush()
+                sys.stdout.write(f"ERR {op_id if op_id else ''} {e}\n")
+                sys.stdout.flush()
 
     finally:
         db.close()
@@ -146,7 +150,7 @@ def main(argv=None):
     # 1. open <path> [--max-bytes N]
     p_open = subparsers.add_parser("open", help="Open or create DB, run recovery, print key count & time")
     p_open.add_argument("path", help="Database file path")
-    p_open.add_argument("--max-bytes", type=int, default=None, help="Maximum allowable database file size")
+    p_open.add_argument("--max-bytes", type=int, default=0, help="Maximum allowable database file size")
 
     # 2. put <path> <key> <value>
     p_put = subparsers.add_parser("put", help="Store key-value pair")
@@ -177,9 +181,10 @@ def main(argv=None):
     p_check = subparsers.add_parser("check", help="Verify database integrity")
     p_check.add_argument("path", help="Database file path")
 
-    # 8. serve <path>
+    # 8. serve <path> [--max-bytes N]
     p_serve = subparsers.add_parser("serve", help="Long-running mode: read ops from stdin, print ACK")
     p_serve.add_argument("path", help="Database file path")
+    p_serve.add_argument("--max-bytes", type=int, default=0, help="Maximum database file size in bytes")
 
     # Optional utility: compact <path>
     p_compact = subparsers.add_parser("compact", help="Trigger crash-safe compaction")
@@ -188,12 +193,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.command == "open":
+        max_bytes = args.max_bytes if args.max_bytes > 0 else None
         t0 = time.perf_counter()
-        db = KVDatabase(args.path, max_bytes=args.max_bytes)
+        db = KVDatabase(args.path, max_bytes=max_bytes)
         t1 = time.perf_counter()
-        count = db.check()
+        key_count = db.check()
+        recovery_time = t1 - t0
         db.close()
-        print(f"OK: {count} keys recovered in {t1 - t0:.4f}s")
+        print(f"OK keys={key_count} recovery_time={recovery_time:.2f}s")
 
     elif args.command == "put":
         db = KVDatabase(args.path)
@@ -254,9 +261,9 @@ def main(argv=None):
     elif args.command == "check":
         try:
             db = KVDatabase(args.path)
-            count = db.check()
+            db.check()
             db.close()
-            print(f"OK: {count} keys")
+            print("OK")
         except Exception as e:
             print(f"CORRUPT: {e}")
             sys.exit(1)
@@ -270,7 +277,8 @@ def main(argv=None):
             db.close()
 
     elif args.command == "serve":
-        run_serve(args.path)
+        max_bytes = args.max_bytes if args.max_bytes > 0 else None
+        run_serve(args.path, max_bytes=max_bytes)
 
 
 if __name__ == "__main__":

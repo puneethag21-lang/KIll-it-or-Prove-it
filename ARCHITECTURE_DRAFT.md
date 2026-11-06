@@ -358,3 +358,4 @@ In [`src/db.py:batch()`](file:///c:/Users/ZOAI/Downloads/live-location-tracker-m
 5. **Directory Fsync on Windows (Section 8, Page 11 vs `src/storage.py:79`)**:
    - *PDF Requirement*: "If you fsync the directory after a rename, say so and say why. If you do not, say why it is safe anyway."
    - *Code Actual*: [`src/storage.py:87`](file:///c:/Users/ZOAI/Downloads/live-location-tracker-master/live-location-tracker-master/demo%20hackto=hon/src/storage.py#L87) checks `if os.name != "nt":` and does not call directory fsync on Windows, relying on NTFS atomic file replacement.
+
