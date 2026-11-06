@@ -3,4 +3,5 @@ __pycache__/
 *.tmp
 *.compact
 *.lock
-
+*.log
+*.kv

@@ -123,3 +123,13 @@ proceed do what u can push ur limits
 ```
 Continue
 ```
+
+---
+
+### Prompt 5
+*Tool:* Gemini 3.8 Flash  
+*Approximate Time:* Hour 15 (Local time: 2026-11-07 01:32 IST)
+
+```
+REMOVE/DELETE unnessary or useless files
+```
