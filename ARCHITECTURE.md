@@ -119,3 +119,44 @@ Atomicity is guaranteed through multi-record transaction framing with a trailing
 ### 3. Recoverability: `open()` Always Succeeds on Our Own Files
 Recoverability is guaranteed because recovery performs only monotonic forward-scanning and tail-truncation. `open()` validates the 16-byte header (`b"KVDB0001"`, version `1`). The recovery parser scans the log using a zero-copy `mmap` memoryview over an isolated read handle (`with open(self.path, "rb") as read_f:`), achieving 1.805s recovery for 1,000,000 keys. If any record is cut short by a crash, contains an incomplete header, or exhibits a CRC mismatch, the parser does not throw an exception; it halts scanning and designates the byte offset of the last valid `COMMIT` as `last_commit_end`. Upon context exit (which releases the mmap view and closes the read handle), the primary writer handle issues `self.file.truncate(last_commit_end)` and `fsync()`. This isolated handle design avoids Windows file-locking conflicts during truncation. Truncation is strictly idempotent: interrupting a truncation with another `kill -9` simply leaves a tail that will be truncated to the exact same offset on the subsequent `open()`. Leftover temporary files from interrupted compactions (`.compact`) are removed on `open()` before the authoritative file is touched, ensuring that `open()` never crashes on any file created by our database.
 
+---
+
+## Part 4: Real-World Specialization: Edge Telemetry Blackbox Storage
+
+To demonstrate practical industrial differentiation while strictly maintaining all hackathon core invariants, the engine is specialized as an **"Edge-Device Offline Telemetry & Audit Blackbox"** (e.g., avionics flight data recorders, automotive crash blackboxes, and mission-critical medical IoT monitors).
+
+### 1. Harsh Edge Operating Conditions
+Edge blackbox environments operate under severe environmental constraints:
+- **Harsh Power Cuts**: Power can be yanked at any arbitrary microsecond (e.g., sudden aircraft generator drop, vehicle battery disconnection during collision).
+- **Periodic Forensic Reads**: Reads are not interactive point queries; they are bulk post-incident forensic extractions and point-in-time audit dumps.
+- **Continuous High-Frequency Writes**: Multi-channel sensor feeds (gyroscopes, accelerometers, engine temperatures, ECG streams) write continuously.
+- **Capped Flash Storage**: Onboard eMMC/NOR/NAND flash memory is tightly capacity-constrained and cannot grow unbounded.
+
+### 2. Structured Binary Telemetry Encoders (`src/telemetry.py`)
+Rather than storing arbitrary strings, the system provides a high-density binary payload encoder that serializes structured domain frames directly into the database's value space without modifying low-level disk framing:
+```
++--------------------+-------------------------+------------------+----------------------+--------------------+--------------------+-----------------------+
+| magic: b'TLM1' (4B)| timestamp_ns: u64 (8B)  | alert_level: u8  | sensor_id_len: u16   | payload_len: u32   | sensor_id (bytes)  | metric payload (JSON) |
++--------------------+-------------------------+------------------+----------------------+--------------------+--------------------+-----------------------+
+|<--------------------------------- Fixed Frame Header = 19 Bytes ----------------------------------->|
+```
+- **Alert Levels**: `0=DEBUG`, `1=INFO`, `2=WARN`, `3=CRITICAL`.
+- **Key Partitioning**: Normal telemetry frames are keyed as `raw:<sensor_id>:<timestamp_ns:020d>`. Emergency, fault, or impact events are keyed with `crit:<sensor_id>:<timestamp_ns:020d>`.
+
+### 3. Priority Retention Flash Compaction (`src/compaction.py`)
+When onboard flash storage approaches `--max-bytes`, conventional compaction (which merely discards overwritten historical keys) is insufficient because telemetry streams consist mostly of new, append-only sensor observations.
+
+The engine introduces **Priority Retention Compaction**:
+- **Critical Event Guarantee**: All high-priority audit tags (keys prefixed with `crit:`) are **100% immune from deletion or pruning**.
+- **Adaptive Flash Budgeting**: The compactor calculates the byte budget remaining after packing critical records, then retains only the most recent non-critical sensor observations, discarding older routine noise to reclaim physical flash sectors.
+- **Crash Safety**: The entire priority compaction occurs in `<path>.compact` and swaps via atomic `os.replace()`, guaranteeing that an unexpected power failure during compaction never corrupts the blackbox.
+
+### 4. Cryptographic Audit Attestation Chain (`check --audit`)
+Regulatory standards (FAA DO-178C, ISO 26262, FDA 21 CFR Part 11) require mathematical proof that post-crash forensic blackbox logs have not been tampered with or altered post-recovery.
+
+The `check` command features a deterministic SHA-256 Merkle chain:
+$$H_0 = 0,\quad H_{i} = \text{SHA256}(H_{i-1} \parallel \text{len}(K_i) \parallel \text{len}(V_i) \parallel K_i \parallel V_i)$$
+Running `kvdb check <path> --audit` produces a cryptographic attestation token:
+`OK audit_hash=cf95179ea6cfbd4368fabcc5a156f3d0b35f327e61d03ed46d43310ebfc827ac`
+This hash provides mathematical immutability and non-repudiation for incident investigations.
+

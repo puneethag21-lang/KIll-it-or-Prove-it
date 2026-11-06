@@ -172,5 +172,24 @@ python torture/torture.py --iterations 100 --seed 999 --mode large-values
 python torture/torture.py --iterations 100 --seed 7 --mode compaction
 python torture/torture.py --iterations 100 --seed 42 --mode recovery-crash
 python torture/torture.py --iterations 100 --seed 123 --mode large-batch
+python torture/torture.py --iterations 10 --seed 3 --mode disk-full --max-bytes 200000
+```
+
+---
+
+## 6. Real-World Specialization: Edge Telemetry & Audit Blackbox
+
+To solve real-world industrial storage challenges on embedded edge hardware, KVDB features a first-class domain specialization for **Edge Telemetry & Audit Blackbox Recorders** (e.g., flight data recorders, automotive crash blackboxes, and patient telemetry monitors).
+
+### Why KVDB Fits This Problem:
+1. **Harsh Power-Loss Survivability**: Power on edge hardware can be yanked at any millisecond. KVDB guarantees that every acknowledged telemetry frame survives `kill -9` with zero torn writes or corrupted blocks.
+2. **Structured Binary Encoders (`src/telemetry.py`)**: High-efficiency binary packing for sensor streams (timestamps, alert levels, metric JSON) packed into the value payload without altering underlying single-file record framing.
+3. **Priority Retention Flash Compaction (`./kvdb compact <path> --priority-retention`)**: Onboard flash storage is strictly capped. Under flash capacity limits, KVDB prunes older routine sensor noise while guaranteeing that 100% of emergency event trails (`crit:` prefix) survive permanently.
+4. **Cryptographic Attestation Chain (`./kvdb check <path> --audit`)**: Computes a deterministic cumulative SHA-256 Merkle hash chain over all confirmed telemetry for regulatory audit integrity.
+
+### Running the Live Blackbox Crash Demo:
+Simulates 50 concurrent high-frequency sensor streams piping into `serve`, abruptly yanks power via `kill -9`, performs post-crash forensic recovery, and verifies zero lost frames:
+```bash
+python scripts/demo_telemetry.py
 ```
 

@@ -328,3 +328,54 @@ We need to resolve all 6 gaps identified in "PART 3 — Gap List & Disagreements
 
 Run the test suite and torture tool after implementing these changes to verify that all 6 gaps are fully closed.
 ```
+
+---
+
+### Prompt 14
+*Tool:* Gemini 3.8 Flash  
+*Approximate Time:* Hour 16 (Local time: 2026-11-07 03:23 IST)
+
+```
+We are evolving our verified crash-safe KVDB engine into a specialized real-world system to demonstrate practical domain differentiation while strictly preserving the hackathon core invariants.
+
+TARGET REAL-WORLD DOMAIN:
+"Edge-Device Offline Telemetry & Audit Blackbox" (e.g., flight recorders, automotive blackboxes, or medical IoT device logs).
+
+In this environment:
+1. Power can be yanked at any millisecond (harsh edge shutdown).
+2. Reads are periodic audit extracts (bulk dump / point-in-time forensic slice).
+3. Writes are mission-critical telemetry frames, sensor packets, and tamper-evident event trails.
+4. Space is tightly capped by onboard flash memory constraints.
+
+SHAPE THE ARCHITECTURE ACCORDING TO THESE SPECIFICATIONS:
+
+1. Maintain Core Invariants & Rules:
+   - Python 3.10+ standard library ONLY.
+   - Authoritative state remains in exactly ONE file.
+   - Zero external persistence/database packages.
+   - Every acknowledged frame MUST survive kill -9.
+   - All 8 mandatory CLI commands (open, put, get, del, batch, dump, check, serve) and existing APIs must remain fully functional.
+
+2. Unique Real-World Extensions to Integrate:
+   - Structured Binary Payload Encoders:
+     Add a telemetry frame packing helper in `kvdb/` that serializes domain records (e.g., timestamp, sensor_id, alert_level, metric_payload) into the existing `put`/`batch` value format without altering low-level record disk framing.
+   - Priority Retention Compaction:
+     In `compaction.py`, add support for retention policies when `--max-bytes` is approached:
+     * Normal compaction discards overwritten keys and tombstones.
+     * Telemetry mode allows pruning low-priority historical events while preserving high-priority audit tags (keys prefixed with `crit:`) when under storage pressure.
+   - Cryptographic Integrity Check in `check`:
+     Enhance the `check` routine so that in addition to structural CRC validation, it computes a deterministic cumulative Merkle/hash chain over valid historical operations for audit attestation.
+
+3. Demo & CLI Additions:
+   - Add a demo CLI mode or sample script (`scripts/demo_telemetry.py`) that showcases:
+     * Simulating 50 high-frequency sensor streams piping into `serve`.
+     * Abruptly killing the process with `kill -9`.
+     * Restarting, auditing the blackbox data integrity, and verifying zero lost ACKed frames.
+   - Keep the existing `torture` tool untouched and fully passing.
+
+4. Update Documentation:
+   - In `ARCHITECTURE.md`, add a dedicated section: "Real-World Specialization: Edge Telemetry Blackbox Storage".
+   - In `README.md`, show how the database solves this practical industrial problem.
+
+Ensure all unit tests and torture runs remain 100% green after these additions.
+```
