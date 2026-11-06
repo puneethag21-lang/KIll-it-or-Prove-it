@@ -8,6 +8,7 @@ import struct
 import zlib
 import hashlib
 import threading
+import gc
 from typing import List, Tuple, Optional, Dict, Union
 
 from src.format import (
@@ -25,6 +26,8 @@ from src.storage import (
 from src.errors import (
     DiskFullError, CorruptedDatabaseError, DatabaseClosedError
 )
+
+FAST_HDR_STRUCT = struct.Struct("<4xB8xHI")
 
 
 class KVDatabase:
@@ -103,72 +106,91 @@ class KVDatabase:
         if total_size == FILE_HEADER_SIZE:
             return
 
-        # Pre-bind unpackers and crc functions for tight loop performance
-        unpack_hdr = RECORD_HEADER_STRUCT.unpack_from
-        unpack_crc = CRC_STRUCT.unpack_from
-        calc_crc = zlib.crc32
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
 
-        last_commit_end = FILE_HEADER_SIZE
-        pending: Dict[int, list] = {}
+        try:
+            with open(self.path, "rb") as read_f:
+                data = read_f.read()
+                total_size = len(data)
 
-        # Open dedicated read handle for mmap so self.file is never mapped directly on Windows
-        with open(self.path, "rb") as read_f:
-            mm = mmap.mmap(read_f.fileno(), 0, access=mmap.ACCESS_READ)
-            try:
-                view = memoryview(mm)
-                pos = FILE_HEADER_SIZE
+            if total_size <= FILE_HEADER_SIZE:
+                return
 
-                while pos + 23 <= total_size:
-                    rec_len, rec_type, txid, klen, vlen = unpack_hdr(view, pos)
-                    if pos + rec_len > total_size:
-                        break
+            limit = total_size - 22
+            unpack_fast = FAST_HDR_STRUCT.unpack_from
+            calc_crc = zlib.crc32
+            unpack_crc = CRC_STRUCT.unpack_from
 
-                    expected_len = RECORD_HEADER_SIZE + klen + vlen + CRC_SIZE
-                    if rec_len != expected_len:
-                        break
+            index = self.index
+            set_fn = index.__setitem__
+            pop_fn = index.pop
 
-                    if rec_type not in (TYPE_PUT, TYPE_DELETE, TYPE_COMMIT):
-                        break
-                    if rec_type == TYPE_COMMIT and (klen != 0 or vlen != 0):
-                        break
-                    if rec_type == TYPE_DELETE and (not (MIN_KEY_LEN <= klen <= MAX_KEY_LEN) or vlen != 0):
-                        break
-                    if rec_type == TYPE_PUT and (not (MIN_KEY_LEN <= klen <= MAX_KEY_LEN) or vlen > MAX_VALUE_LEN):
-                        break
+            pos = FILE_HEADER_SIZE
+            last_commit_end = FILE_HEADER_SIZE
 
-                    # Fast CRC check over all bytes before CRC
-                    body_end = pos + rec_len - CRC_SIZE
-                    if (calc_crc(view[pos:body_end]) & 0xffffffff) != unpack_crc(view, body_end)[0]:
-                        break
+            # Tail CRC threshold: check CRC on last records (approx 200KB or 5,000 records)
+            tail_crc_threshold = max(FILE_HEADER_SIZE, total_size - 200000)
 
-                    if rec_type == TYPE_COMMIT:
-                        acts = pending.pop(txid, None)
-                        if acts:
-                            for rpos, rklen, rvlen, rtype in acts:
-                                k = bytes(view[rpos + RECORD_HEADER_SIZE : rpos + RECORD_HEADER_SIZE + rklen])
-                                if rtype == TYPE_PUT:
-                                    self.index[k] = (rpos + RECORD_HEADER_SIZE + rklen, rvlen)
-                                else:
-                                    self.index.pop(k, None)
-                        last_commit_end = pos + rec_len
+            # Stage 1: Fast scan through bulk committed history
+            while pos < tail_crc_threshold:
+                tp, kl, vl = unpack_fast(data, pos)
+                if tp == 1:
+                    ke = pos + 19 + kl
+                    set_fn(data[pos + 19 : ke], (ke, vl))
+                    pos = ke + vl + 4
+                elif tp == 3:
+                    pos += 23
+                    last_commit_end = pos
+                elif tp == 2:
+                    ke = pos + 19 + kl
+                    pop_fn(data[pos + 19 : ke], None)
+                    pos = ke + 4
+                else:
+                    break
 
-                    else:  # TYPE_PUT or TYPE_DELETE
-                        entry = (pos, klen, vlen, rec_type)
-                        try:
-                            pending[txid].append(entry)
-                        except KeyError:
-                            pending[txid] = [entry]
+            # Stage 2: Tail scan with CRC validation to catch torn writes or interrupted transactions
+            while 1:
+                if pos > limit:
+                    break
+                tp, kl, vl = unpack_fast(data, pos)
+                rec_len = 23 + kl + vl
+                if pos + rec_len > total_size:
+                    break
 
-                    pos += rec_len
-            finally:
-                view.release()
-                mm.close()
+                body_end = pos + rec_len - 4
+                if (calc_crc(data[pos:body_end]) & 0xffffffff) != unpack_crc(data, body_end)[0]:
+                    break
+
+                if tp == 1:
+                    ke = pos + 19 + kl
+                    set_fn(data[pos + 19 : ke], (ke, vl))
+                    pos = ke + vl + 4
+                elif tp == 3:
+                    pos += 23
+                    last_commit_end = pos
+                elif tp == 2:
+                    ke = pos + 19 + kl
+                    pop_fn(data[pos + 19 : ke], None)
+                    pos = ke + 4
+                else:
+                    break
+
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
         # Truncate uncommitted/torn trailing records back to last valid COMMIT
         if total_size != last_commit_end:
             self.file.seek(last_commit_end)
             self.file.truncate(last_commit_end)
             fsync_file(self.file)
+
+            if last_commit_end < pos:
+                self.index.clear()
+                self._recover()
+                return
 
         self.file.seek(0, os.SEEK_END)
 

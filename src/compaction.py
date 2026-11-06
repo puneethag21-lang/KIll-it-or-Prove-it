@@ -118,3 +118,4 @@ def compact_database(
             db._recover()
 
             return len(retained_keys), pruned_count
+

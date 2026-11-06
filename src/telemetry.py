@@ -130,3 +130,4 @@ def decode_telemetry_frame(data: bytes) -> TelemetryFrame:
         timestamp_ns=ts_ns,
         raw_payload=payload_raw,
     )
+

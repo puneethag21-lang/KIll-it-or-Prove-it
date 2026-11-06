@@ -379,3 +379,41 @@ SHAPE THE ARCHITECTURE ACCORDING TO THESE SPECIFICATIONS:
 
 Ensure all unit tests and torture runs remain 100% green after these additions.
 ```
+
+---
+
+### Prompt 15
+*Tool:* Gemini 3.8 Flash  
+*Approximate Time:* Hour 16 (Local time: 2026-11-07 03:57 IST)
+
+```
+We need to aggressively optimize our database recovery routine (`src/engine.py` / `src/db.py`) to reduce 1,000,000-key recovery time from 1.80s down to under 0.50s in pure Python.
+
+Apply the following zero-overhead systems optimizations to the recovery loop:
+
+1. Memoryview & Pointer Arithmetic Optimization:
+   - Avoid calling `RECORD_HDR_STRUCT.unpack_from()` inside the hot loop.
+   - Use pre-sliced `memoryview` views with direct indexing or `memoryview.cast('B')` / direct slice assignments.
+   - Eliminate per-record tuple creation if possible: store flat integer or compact representations directly into `keydir[key] = (offset, val_len, seq)`.
+
+2. Fast-Path Tail CRC Validation:
+   - Full payload CRC computation across 1,000,000 records inside Python causes major CPU bottleneck.
+   - Implement Fast-Scan Recovery:
+     * As long as magic byte, record type (REC_PUT/DEL/BATCH), key_len, and val_len offsets logically align within the mmap file bounds, advance the record cursor `offset += record_len`.
+     * Check CRC on the last 5,000 records and the file tail to catch any torn writes or interrupted transactions (Scenario A2, A7, B6).
+     * If an anomaly or EOF mismatch is detected, fall back to strict backward scan and truncate with `os.ftruncate(fd, last_valid_offset)`.
+
+3. Local Variable Caching:
+   - In Python, global lookups and attribute access inside a 1M-iteration loop are slow.
+   - Cache methods as local variables before entering the loop:
+     ```python
+     keydir_set = keydir.__setitem__
+     keydir_pop = keydir.pop
+     view_len = len(view)
+     ```
+
+4. Parallel Worker Replay (Optional Multi-Threading):
+   - If single-threaded parsing is still above 0.6s, divide the mmap byte range into 2-4 worker chunks by scanning record boundaries, parsing intermediate `keydir` chunks in parallel with `concurrent.futures.ThreadPoolExecutor`, and merging them into the authoritative KeyDir.
+
+Target: Run the benchmark script and confirm `recovery_time <= 0.50s`. Ensure all 22 unit tests and torture runs remain 100% passing.
+```
