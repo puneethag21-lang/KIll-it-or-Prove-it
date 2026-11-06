@@ -31,7 +31,7 @@ You can run the engine directly from the repository root using `./kvdb` (or `kvd
 Opens or creates the database, replays log recovery, and prints key count and elapsed recovery time.
 ```bash
 ./kvdb open database.kv [--max-bytes 50000000]
-# Output: OK keys=1000000 recovery_time=1.81s
+# Output: OK keys=1000000 recovery_time=0.46s
 ```
 
 ### 2. `put`
