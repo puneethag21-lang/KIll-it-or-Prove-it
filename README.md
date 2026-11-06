@@ -13,7 +13,10 @@ Synterra KVDB requires **zero external dependencies** (Python 3.8+ standard libr
 # Verify Python 3 is installed
 python --version
 
-# On Windows:
+# Launch the interactive Terminal UI (default when run without arguments):
+python kvdb.py
+
+# Or run CLI directly on Windows:
 kvdb.bat open test.kv
 
 # On Linux / macOS:

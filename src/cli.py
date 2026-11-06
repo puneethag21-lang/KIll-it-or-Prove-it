@@ -144,11 +144,21 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
 
+    # Launch interactive Terminal UI by default when executed without arguments
+    if len(argv) == 0:
+        from src.tui import run_tui
+        run_tui()
+        return
+
     parser = argparse.ArgumentParser(
         prog="kvdb",
         description="Synterra Crash-Safe Key-Value Database"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # 0. ui [path]
+    p_ui = subparsers.add_parser("ui", help="Launch interactive Terminal UI")
+    p_ui.add_argument("path", nargs="?", default="synterra.kv", help="Database file path")
 
     # 1. open <path> [--max-bytes N]
     p_open = subparsers.add_parser("open", help="Open or create DB, run recovery, print key count & time")
@@ -293,6 +303,10 @@ def main(argv=None):
     elif args.command == "serve":
         max_bytes = args.max_bytes if args.max_bytes > 0 else None
         run_serve(args.path, max_bytes=max_bytes)
+
+    elif args.command == "ui":
+        from src.tui import run_tui
+        run_tui(args.path)
 
 
 if __name__ == "__main__":

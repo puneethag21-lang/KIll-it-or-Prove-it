@@ -417,3 +417,92 @@ Apply the following zero-overhead systems optimizations to the recovery loop:
 
 Target: Run the benchmark script and confirm `recovery_time <= 0.50s`. Ensure all 22 unit tests and torture runs remain 100% passing.
 ```
+
+---
+
+### Prompt 16
+*Tool:* Gemini 3.8 Flash  
+*Approximate Time:* Hour 17 (Local time: 2026-11-07 04:46 IST)
+
+```
+# Task: Build a Premium Interactive Terminal UI for Synterra KVDB
+
+Act as a senior Python CLI developer and terminal UI designer.
+
+I have an existing project called Synterra KVDB, a crash-safe embedded key-value database built from scratch in Python for a hackathon.
+
+I want to transform its current command-line experience into a beautiful, minimalist, interactive terminal application.
+
+## 1. DESIGN REFERENCE
+
+Follow the minimalist OpenCode-inspired terminal design I shared.
+
+The visual identity should have:
+- Deep midnight navy / almost-black background.
+- Minimal macOS-style terminal title bar.
+- Red, yellow and green window controls.
+- Large centered pixel-style SYNTERRA KVDB logo.
+- Soft blue, lavender and purple typography.
+- Clean monospaced fonts.
+- Generous empty space.
+- Small, neatly aligned command guide.
+- Wide purple-tinted input bar near the bottom.
+- Minimal footer with database information and keyboard shortcuts.
+
+Do not create a dashboard, web application or GUI.
+It must remain a terminal-based application.
+
+## 2. STARTUP SCREEN
+
+When the user launches Synterra, display:
+
+SYNTERRA KVDB
+v1.0.0
+
+Crash-Safe Embedded Key-Value Database
+
+Show these commands:
+/help       Show all commands
+/put        Set a key-value pair
+/get        Read a key
+/delete     Remove a key
+/batch      Apply batch operations
+/dump       List all keys
+/check      Verify database integrity
+/compact    Shrink the database
+/serve      Start HTTP server
+/exit       Exit the application
+
+At the bottom, show an interactive input prompt.
+
+## 3. INTERACTIVE BEHAVIOUR
+
+The user should be able to type commands directly into the terminal.
+All commands must connect to the existing database engine and perform real operations.
+Do not simulate command results.
+
+## 4. DATABASE STATUS
+
+Display actual database information where available:
+- Database filename
+- Current number of active keys
+- Database file size
+- Database status
+- Application version
+
+## 5. TECHNICAL REQUIREMENTS
+
+1. First inspect the entire existing repository.
+2. Understand the current engine and CLI implementation.
+3. Preserve all existing database functionality.
+4. Do not rewrite the storage engine.
+5. Do not modify record formats, recovery, transaction logic or compaction.
+6. Keep the new terminal interface separate from the core database engine.
+7. Ensure compatibility with Windows PowerShell and VS Code terminal.
+8. Handle invalid commands and errors gracefully.
+9. Add clean keyboard handling where practical.
+10. Avoid unnecessary dependencies.
+
+## 6. TESTING
+Run all existing unit tests and torture tests. Verify persistence and CLI compatibility.
+```
