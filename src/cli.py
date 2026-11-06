@@ -116,7 +116,10 @@ def run_serve(db_path: str, max_bytes: Optional[int] = None):
                         db.batch(ops)
 
                 elif cmd == "compact":
-                    db.compact()
+                    if cmd_args and cmd_args[0] in ("--priority", "priority", "telemetry"):
+                        db.compact(priority_retention=True)
+                    else:
+                        db.compact()
 
                 # Print ACK only AFTER durable fsync
                 if op_id is not None:
@@ -177,18 +180,21 @@ def main(argv=None):
     p_dump = subparsers.add_parser("dump", help="Print all keys and values sorted by key")
     p_dump.add_argument("path", help="Database file path")
 
-    # 7. check <path>
+    # 7. check <path> [--audit]
     p_check = subparsers.add_parser("check", help="Verify database integrity")
     p_check.add_argument("path", help="Database file path")
+    p_check.add_argument("--audit", "--attest", action="store_true", help="Output cryptographic audit attestation hash")
 
     # 8. serve <path> [--max-bytes N]
     p_serve = subparsers.add_parser("serve", help="Long-running mode: read ops from stdin, print ACK")
     p_serve.add_argument("path", help="Database file path")
     p_serve.add_argument("--max-bytes", type=int, default=0, help="Maximum database file size in bytes")
 
-    # Optional utility: compact <path>
+    # Optional utility: compact <path> [--priority-retention] [--target-bytes N]
     p_compact = subparsers.add_parser("compact", help="Trigger crash-safe compaction")
     p_compact.add_argument("path", help="Database file path")
+    p_compact.add_argument("--priority-retention", action="store_true", help="Preserve crit: tags while pruning older telemetry")
+    p_compact.add_argument("--target-bytes", type=int, default=None, help="Target storage budget in bytes")
 
     args = parser.parse_args(argv)
 
@@ -261,9 +267,14 @@ def main(argv=None):
     elif args.command == "check":
         try:
             db = KVDatabase(args.path)
-            db.check()
-            db.close()
-            print("OK")
+            if getattr(args, "audit", False):
+                _, audit_hash = db.check(return_hash=True)
+                db.close()
+                print(f"OK audit_hash={audit_hash}")
+            else:
+                db.check()
+                db.close()
+                print("OK")
         except Exception as e:
             print(f"CORRUPT: {e}")
             sys.exit(1)
@@ -271,7 +282,10 @@ def main(argv=None):
     elif args.command == "compact":
         db = KVDatabase(args.path)
         try:
-            db.compact()
+            db.compact(
+                priority_retention=getattr(args, "priority_retention", False),
+                target_max_bytes=getattr(args, "target_bytes", None)
+            )
             print("OK")
         finally:
             db.close()

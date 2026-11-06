@@ -6,8 +6,9 @@ import os
 import mmap
 import struct
 import zlib
+import hashlib
 import threading
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Union
 
 from src.format import (
     FILE_MAGIC, FILE_VERSION, FILE_HEADER_SIZE,
@@ -285,15 +286,40 @@ class KVDatabase:
             self.file.seek(offset)
             return self.file.read(length)
 
-    def check(self) -> int:
+    def _compute_audit_hash_locked(self) -> str:
+        h = hashlib.sha256()
+        for k in sorted(self.index.keys()):
+            offset, length = self.index[k]
+            self.file.seek(offset)
+            val = self.file.read(length)
+            entry = struct.pack(">IH", len(k), len(val)) + k + val
+            h.update(entry)
+        return h.hexdigest()
+
+    def compute_audit_hash(self) -> str:
         """
-        Verifies database integrity under lock and returns count of active keys.
+        Computes a deterministic cryptographic SHA-256 hash chain
+        over all confirmed keys and values for tamper-evident audit attestation.
         """
         self._ensure_open()
         with self.lock:
             with file_lock(self.lock_file):
                 self._ensure_open()
-                return len(self.index)
+                return self._compute_audit_hash_locked()
+
+    def check(self, return_hash: bool = False) -> Union[int, Tuple[int, str]]:
+        """
+        Verifies database integrity under lock and returns count of active keys.
+        If return_hash is True, returns (key_count, audit_hash).
+        """
+        self._ensure_open()
+        with self.lock:
+            with file_lock(self.lock_file):
+                self._ensure_open()
+                key_count = len(self.index)
+                if return_hash:
+                    return key_count, self._compute_audit_hash_locked()
+                return key_count
 
     def dump(self) -> List[Tuple[bytes, bytes]]:
         """
@@ -310,56 +336,18 @@ class KVDatabase:
                 results.append((k, val))
             return results
 
-    def compact(self):
+    def compact(self, priority_retention: bool = False, target_max_bytes: Optional[int] = None):
         """
         Crash-safe database compaction:
-        1. Writes all live key-values into <path>.compact
+        1. Writes retained key-values into <path>.compact
         2. Flushes & fsyncs <path>.compact
         3. Closes main handle
         4. Replaces old database with new compacted file via os.replace
         5. Reopens and re-indexes
+        If priority_retention is True, preserves 'crit:' prefixed events while pruning older telemetry.
         """
-        self._ensure_open()
-
-        with self.lock:
-            with file_lock(self.lock_file):
-                self._ensure_open()
-
-                compact_temp = self.path + ".compact"
-                if os.path.exists(compact_temp):
-                    os.remove(compact_temp)
-
-                txid = int.from_bytes(os.urandom(8), "little")
-
-                # Write live keys to temporary file
-                with open(compact_temp, "w+b") as temp_f:
-                    temp_f.write(encode_file_header())
-
-                    for key in sorted(self.index.keys()):
-                        offset, length = self.index[key]
-                        self.file.seek(offset)
-                        val = self.file.read(length)
-                        rec = encode_record(TYPE_PUT, txid, key, val)
-                        temp_f.write(rec)
-
-                    commit_rec = encode_record(TYPE_COMMIT, txid)
-                    temp_f.write(commit_rec)
-
-                    fsync_file(temp_f)
-
-                # Close current database handle before replacing on Windows
-                self.file.close()
-                self.file = None
-
-                # Atomic file replacement
-                os.replace(compact_temp, self.path)
-
-                # Sync directory metadata if on POSIX
-                sync_directory_if_posix(self.path)
-
-                # Reopen and rebuild index
-                self.file = open(self.path, "r+b")
-                self._recover()
+        from src.compaction import compact_database
+        compact_database(self, priority_retention=priority_retention, target_max_bytes=target_max_bytes)
 
     def close(self):
         """Flush and close cleanly."""
