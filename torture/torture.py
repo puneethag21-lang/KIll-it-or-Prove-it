@@ -26,7 +26,7 @@ class IndependentOracle:
         self.lock = threading.Lock()
         # key -> latest acknowledged value (or None if deleted)
         self.acked_state: Dict[bytes, Optional[bytes]] = {}
-        # In-flight operations: op_id -> (op_type, details)
+        # In-flight operations for current run: op_id -> (op_type, details)
         self.in_flight: Dict[str, Tuple[str, list]] = {}
         # History of all valid values ever seen for each key
         self.known_values_per_key: Dict[bytes, Set[bytes]] = {}
@@ -64,6 +64,16 @@ class IndependentOracle:
                         self.acked_state[k] = None
                     else:
                         self.acked_state[k] = v
+
+    def resolve_after_pass(self, dumped_state: Dict[bytes, bytes]):
+        """
+        After verify_against_dump PASSES for an iteration, resolve state:
+        set acked_state to exactly the dump contents, clear in_flight,
+        keep known_values_per_key intact.
+        """
+        with self.lock:
+            self.acked_state = dict(dumped_state)
+            self.in_flight.clear()
 
     def verify_against_dump(self, dumped_state: Dict[bytes, bytes]) -> Tuple[bool, str]:
         """
@@ -113,13 +123,20 @@ class IndependentOracle:
                 if found_v not in known_vals:
                     return False, f"Garbage / torn value found for key {k}: {found_v}"
 
+                # If key was never in acked_state, it must be explained by an in-flight un-ACKed op
+                if k not in self.acked_state:
+                    in_flight_explains = any(
+                        any(item[0] == k and item[1] == found_v for item in details)
+                        for _, details in self.in_flight.values()
+                    )
+                    if not in_flight_explains:
+                        return False, f"Key {k} was never ACKed and not in-flight, but found in dump with value: {found_v}"
+
             # 3. Check batch all-or-nothing for in-flight batches
             for op_id, (op_type, details) in self.in_flight.items():
                 if op_type == "batch" and len(details) > 1:
                     applied = [dumped_state.get(k) == v for k, v in details]
                     if any(applied) and not all(applied):
-                        # Verify if conflicting ops explain the difference
-                        # If strict without conflicts, report partial batch
                         pass
 
             return True, "OK"
@@ -136,6 +153,15 @@ class TortureRunner:
 
         self.db_path = os.path.abspath("torture_test.kv")
         self.oracle_log = os.path.abspath("oracle.log")
+
+        # Global counter for guaranteeing unique values across the entire run
+        self.global_val_counter = 0
+        self.counter_lock = threading.Lock()
+
+    def next_val_id(self) -> int:
+        with self.counter_lock:
+            self.global_val_counter += 1
+            return self.global_val_counter
 
     def _cleanup_files(self):
         for p in (self.db_path, self.db_path + ".lock", self.db_path + ".compact", self.oracle_log):
@@ -166,9 +192,12 @@ class TortureRunner:
 
         stop_workers = threading.Event()
         stdin_lock = threading.Lock()
+        acks_count = 0
+        acks_lock = threading.Lock()
 
         # Reader thread listening for ACKs - drains stdout completely until EOF
         def ack_listener():
+            nonlocal acks_count
             while True:
                 line = proc.stdout.readline()
                 if not line:
@@ -179,6 +208,8 @@ class TortureRunner:
                     if len(parts) >= 2:
                         op_id = parts[1]
                         oracle.record_ack(op_id)
+                        with acks_lock:
+                            acks_count += 1
 
         listener_thread = threading.Thread(target=ack_listener, daemon=True)
         listener_thread.start()
@@ -190,11 +221,14 @@ class TortureRunner:
             while not stop_workers.is_set() and proc.poll() is None:
                 seq += 1
                 op_id = f"w{worker_id}_{iter_num}_{seq}"
+                val_id = self.next_val_id()
 
                 if self.mode == "large-values":
                     k = f"k_{worker_id}_{w_rng.randint(1, 10)}".encode()
                     v_size = w_rng.randint(500 * 1024, 1024 * 1024)
-                    v = os.urandom(v_size)
+                    prefix = f"val_it{iter_num}_w{worker_id}_c{val_id}_".encode()
+                    pad_len = max(0, v_size - len(prefix))
+                    v = prefix + os.urandom(pad_len)
                     oracle.register_in_flight(op_id, "put", [(k, v)])
                     msg = f"{op_id} put {k.decode()} {v.hex()}\n".encode()
 
@@ -202,8 +236,9 @@ class TortureRunner:
                     batch_ops = []
                     msg_parts = [f"{op_id} batch "]
                     for b_idx in range(w_rng.randint(50, 200)):
+                        b_val_id = self.next_val_id()
                         bk = f"bk_{worker_id}_{b_idx}".encode()
-                        bv = f"bv_{b_idx}".encode()
+                        bv = f"bv_it{iter_num}_w{worker_id}_c{b_val_id}".encode()
                         batch_ops.append((bk, bv))
                         msg_parts.append(f"put {bk.decode()} {bv.decode()};")
                     oracle.register_in_flight(op_id, "batch", batch_ops)
@@ -215,7 +250,7 @@ class TortureRunner:
                         oracle.register_in_flight(op_id, "compact", [])
                     else:
                         k = f"k_{w_rng.randint(1, 20)}".encode()
-                        v = f"v_{seq}".encode()
+                        v = f"v_it{iter_num}_w{worker_id}_c{val_id}".encode()
                         oracle.register_in_flight(op_id, "put", [(k, v)])
                         msg = f"{op_id} put {k.decode()} {v.decode()}\n".encode()
 
@@ -223,7 +258,7 @@ class TortureRunner:
                     roll = w_rng.random()
                     k = f"key_{w_rng.randint(1, 40)}".encode()
                     if roll < 0.65:
-                        v = f"val_{worker_id}_{seq}".encode()
+                        v = f"val_it{iter_num}_w{worker_id}_c{val_id}".encode()
                         oracle.register_in_flight(op_id, "put", [(k, v)])
                         msg = f"{op_id} put {k.decode()} {v.decode()}\n".encode()
                     elif roll < 0.85:
@@ -231,9 +266,11 @@ class TortureRunner:
                         msg = f"{op_id} del {k.decode()}\n".encode()
                     else:
                         k2 = f"key_{w_rng.randint(1, 40)}".encode()
-                        v2 = f"batchval_{seq}".encode()
-                        oracle.register_in_flight(op_id, "batch", [(k, f"b1_{seq}".encode()), (k2, v2)])
-                        msg = f"{op_id} batch put {k.decode()} b1_{seq};put {k2.decode()} {v2.decode()}\n".encode()
+                        val_id2 = self.next_val_id()
+                        v1 = f"b1_it{iter_num}_w{worker_id}_c{val_id}".encode()
+                        v2 = f"b2_it{iter_num}_w{worker_id}_c{val_id2}".encode()
+                        oracle.register_in_flight(op_id, "batch", [(k, v1), (k2, v2)])
+                        msg = f"{op_id} batch put {k.decode()} {v1.decode()};put {k2.decode()} {v2.decode()}\n".encode()
 
                 try:
                     with stdin_lock:
@@ -262,6 +299,10 @@ class TortureRunner:
         w1.join(timeout=0.2)
         w2.join(timeout=0.2)
         listener_thread.join(timeout=1.0)
+
+        # Warning when 0 ACKs occurred in this iteration
+        if acks_count == 0:
+            print(f"WARN: 0 ACKs this iteration (iter {iter_num})")
 
         # Mode: recovery-crash
         if self.mode == "recovery-crash":
@@ -304,6 +345,11 @@ class TortureRunner:
             dumped_state[k] = v
 
         passed, reason = oracle.verify_against_dump(dumped_state)
+        if passed:
+            # Step 1b: Resolve upon pass
+            oracle.resolve_after_pass(dumped_state)
+        # On failure, do not resolve; report the failure
+
         return passed, reason
 
     def run(self):
@@ -321,7 +367,7 @@ class TortureRunner:
                 sys.exit(1)
 
             if i % 25 == 0 or i == self.iterations or i <= 5:
-                active_keys = len([k for k, v in oracle.acked_state.items() if v is not None])
+                active_keys = len(oracle.acked_state)
                 print(f"[Iteration {i:03d}/{self.iterations:03d}] PASS (mode={self.mode}, oracle_active_keys={active_keys})")
 
         elapsed = time.time() - start_time
