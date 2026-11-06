@@ -163,3 +163,13 @@ so how to check output'
 ```
 Continue
 ```
+
+---
+
+### Prompt 9
+*Tool:* Gemini 3.8 Flash  
+*Approximate Time:* Hour 15 (Local time: 2026-11-07 01:52 IST)
+
+```
+bro tell me one by one
+```
