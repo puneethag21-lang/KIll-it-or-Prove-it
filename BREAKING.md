@@ -71,3 +71,4 @@ We acknowledge the following three genuine architectural weaknesses in our desig
    To handle databases with > 10,000,000 keys, we would persist an immutable checkpoint index file (`.idx`) during compaction, reducing `open()` recovery time from 1.48 seconds to under 0.05 seconds regardless of log length.
 3. **Background Auto-Compaction Daemon**:  
    We would implement an asynchronous background compaction thread that triggers copy-on-write compaction whenever deleted or overwritten keys exceed 30% of total log volume, completely automating file shrinkage.
+
