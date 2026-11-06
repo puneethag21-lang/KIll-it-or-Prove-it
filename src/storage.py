@@ -110,3 +110,4 @@ def sync_directory_if_posix(file_path: str):
                 os.close(dfd)
         except OSError:
             pass
+

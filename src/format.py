@@ -127,3 +127,4 @@ def decode_record_from_bytes(data: bytes):
     val_bytes = bytes(data[RECORD_HEADER_SIZE + klen : body_end])
 
     return rec_type, txid, key_bytes, val_bytes, rec_len
+

@@ -20,3 +20,4 @@ class CorruptedDatabaseError(KVDBError):
 class DatabaseClosedError(KVDBError):
     """Raised when attempting an operation on a closed database."""
     pass
+

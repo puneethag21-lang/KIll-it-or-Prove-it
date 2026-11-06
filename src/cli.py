@@ -53,6 +53,10 @@ def run_serve(db_path: str):
     """
     db = KVDatabase(db_path)
     try:
+        # Signal readiness to supervisor
+        sys.stdout.write("READY\n")
+        sys.stdout.flush()
+
         for line in sys.stdin:
             line = line.strip()
             if not line:
@@ -91,14 +95,12 @@ def run_serve(db_path: str):
                     db.delete(cmd_args[0])
 
                 elif cmd == "batch":
-                    # Arg could be a file path or inline commands separated by semicolon / commas
                     if not cmd_args:
                         continue
                     batch_arg = cmd_args[0]
                     if os.path.exists(batch_arg):
                         ops = parse_batch_file(batch_arg)
                     else:
-                        # Inline batch format: "put k1 v1;del k2"
                         ops = []
                         raw_ops = " ".join(cmd_args).split(";")
                         for rop in raw_ops:
