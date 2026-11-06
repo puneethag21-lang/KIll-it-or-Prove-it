@@ -173,6 +173,52 @@ class TestKVDatabaseEngine(unittest.TestCase):
         finally:
             db.close()
 
+    def test_telemetry_and_priority_compaction(self):
+        """Test telemetry frame encoding/decoding and priority retention under flash constraint."""
+        from src.telemetry import TelemetryFrame, encode_telemetry_frame, decode_telemetry_frame, ALERT_CRITICAL, ALERT_INFO
+
+        db = KVDatabase(self.db_path)
+        try:
+            f_norm = TelemetryFrame("GPS-01", {"lat": 37.77, "lon": -122.41}, alert_level=ALERT_INFO)
+            f_crit = TelemetryFrame("ECG-01", {"heart_rate": 180, "arrhythmia": True}, alert_level=ALERT_CRITICAL)
+
+            db.put(f_norm.make_key(), encode_telemetry_frame(f_norm))
+            db.put(f_crit.make_key(), encode_telemetry_frame(f_crit))
+
+            self.assertEqual(db.check(), 2)
+
+            # Verify decode
+            raw_crit = db.get(f_crit.make_key())
+            decoded_crit = decode_telemetry_frame(raw_crit)
+            self.assertEqual(decoded_crit.sensor_id, "ECG-01")
+            self.assertTrue(decoded_crit.is_critical)
+            self.assertEqual(decoded_crit.metrics["heart_rate"], 180)
+
+            # Priority compaction prunes non-critical while preserving crit:
+            db.compact(priority_retention=True)
+            self.assertEqual(db.check(), 1)
+            self.assertIsNotNone(db.get(f_crit.make_key()))
+            self.assertIsNone(db.get(f_norm.make_key()))
+        finally:
+            db.close()
+
+    def test_audit_hash_attestation(self):
+        """Test cryptographic hash chain attestation in check()."""
+        db = KVDatabase(self.db_path)
+        try:
+            db.put(b"k1", b"v1")
+            count, hash1 = db.check(return_hash=True)
+            self.assertEqual(count, 1)
+            self.assertEqual(len(hash1), 64)
+
+            # Adding another key deterministically mutates hash
+            db.put(b"k2", b"v2")
+            count2, hash2 = db.check(return_hash=True)
+            self.assertEqual(count2, 2)
+            self.assertNotEqual(hash1, hash2)
+        finally:
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()
