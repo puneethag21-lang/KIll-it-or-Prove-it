@@ -218,3 +218,43 @@ d) Run: python torture/torture.py --iterations 10 --seed 3 --mode disk-full --ma
 Do not claim any step works without showing the output. Stop after each step
 and wait for me to say "next".
 ```
+
+---
+
+### Prompt 11
+*Tool:* Gemini 3.8 Flash  
+*Approximate Time:* Hour 15 (Local time: 2026-11-07 02:19 IST)
+
+```
+Do NOT change any code. Read the actual files (kvdb.py, src/cli.py, src/db.py,
+src/storage.py, src/format.py, src/errors.py) and create ONE new file:
+ARCHITECTURE_DRAFT.md. Describe only what the code really does, not what it
+should do. Every claim must cite the file and function name. Where something is
+not implemented or I cannot confirm it from the code, write "NOT VERIFIED".
+
+PART 1 - HIGH-LEVEL DESIGN
+- Components and responsibilities: CLI/serve, DB API, storage/log writer, index,
+  recovery, compaction, disk-full guard, locks, torture tool.
+- A Mermaid diagram showing these components and the arrows between them.
+- Data flow for: put, get, delete, batch, open+recovery, compaction, serve+ACK.
+
+PART 2 - LOW-LEVEL DESIGN
+- Exact on-disk layout: file header and record format with field sizes in bytes,
+  endianness, CRC coverage, commit marker. It must match a hex dump of a real
+  file: create one with "python kvdb.py put x.kv a b" and show the first bytes.
+- Data structures: the in-memory index and what it stores.
+- For each operation, the numbered write ordering with the exact calls
+  (write, flush, os.fsync, rename/os.replace) and where ACK is printed.
+- Recovery algorithm step by step, and what happens if it is killed midway.
+- Compaction protocol step by step: temp file name, fsync points, the swap,
+  cleanup, and the state of disk at each possible crash point.
+- Locking: which locks exist (threading lock, .lock file), what each protects.
+- Disk-full handling: where max_bytes is checked and what is on disk when it fails.
+
+PART 3 - GAP LIST
+A table of (requirement from the Synterra PDF, implemented?, tested?, evidence).
+Mark each: implemented+tested, implemented+untested, partial, not implemented.
+Include recovery time at 1,000,000 keys as NOT VERIFIED unless you measure it.
+
+Finish by listing any place where the code and the PDF disagree.
+```
