@@ -173,3 +173,48 @@ Continue
 ```
 bro tell me one by one
 ```
+
+---
+
+### Prompt 10
+*Tool:* Gemini 3.8 Flash  
+*Approximate Time:* Hour 15 (Local time: 2026-11-07 02:15 IST)
+
+```
+Edit ONLY torture/torture.py. Do not touch kvdb.py or anything in src/.
+Goal: make the oracle strict and the modes honest. Do these in order and run
+the tool after each one, showing the REAL output.
+
+STEP 1 - Oracle strictness
+a) Make every written value unique across the whole run (include iter_num and
+   a global counter in the value text) so old un-ACKed ops can never explain a
+   wrong value in a later iteration.
+b) After verify_against_dump PASSES for an iteration, resolve it: set
+   acked_state to exactly the dump contents, clear in_flight, keep
+   known_values_per_key. On failure, do not resolve; report the failure.
+c) Count ACKs per iteration. Print "WARN: 0 ACKs this iteration" when none.
+d) Run: python torture/torture.py --iterations 50 --seed 5
+
+STEP 2 - Real batch atomicity check
+a) Give every batch UNIQUE values per batch (for example "b<opid>_<index>"),
+   with many distinct keys per batch.
+b) Implement the batch all-or-nothing check that is currently "pass":
+   for each in-flight batch, either ALL of its final per-key values are present
+   in the dump or NONE are (handle keys repeated inside one batch: last op wins).
+   Report "partial batch <op_id>" with the keys found vs expected.
+c) In large-batch mode, add a branch that sends batches of 2,000 to 10,000 ops.
+d) Run: python torture/torture.py --iterations 20 --seed 6 --mode large-batch
+
+STEP 3 - Real disk-full mode
+a) Pass --max-bytes to "kvdb.py serve" (use whatever flag kvdb.py serve accepts;
+   read cli.py first and tell me the flag you found).
+b) Add a disk-full branch to the worker: keep writing until the server replies
+   with an error line. Treat error replies as NOT ACKed. Verify afterwards that
+   (1) check says OK, (2) every ACKed op is present, (3) no op that errored is
+   visible, (4) after deleting keys and running compact, writes succeed again.
+c) Fail the iteration if zero ACKs AND zero error replies happened (vacuous pass).
+d) Run: python torture/torture.py --iterations 10 --seed 3 --mode disk-full --max-bytes 200000
+
+Do not claim any step works without showing the output. Stop after each step
+and wait for me to say "next".
+```
