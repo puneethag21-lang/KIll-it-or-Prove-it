@@ -219,6 +219,46 @@ class TestKVDatabaseEngine(unittest.TestCase):
         finally:
             db.close()
 
+    def test_stats_observability(self):
+        """Test stats() output with live keys, tombstones, and compaction reclamation."""
+        db = KVDatabase(self.db_path)
+        try:
+            db.put("k1", "v1")
+            db.put("k2", "v2")
+            db.delete("k1")
+            s = db.stats()
+            self.assertEqual(s["live_keys"], 1)
+            self.assertEqual(s["tombstones"], 1)
+            self.assertGreater(s["reclaimable_bytes"], 0)
+
+            db.compact()
+            s_compact = db.stats()
+            self.assertEqual(s_compact["live_keys"], 1)
+            self.assertEqual(s_compact["tombstones"], 0)
+            self.assertEqual(s_compact["reclaimable_bytes"], 0)
+        finally:
+            db.close()
+
+    def test_edge_cases_sub_header_and_empty_values(self):
+        """Test recovery on <16 byte files and zero-length values."""
+        # 1. File smaller than 16-byte header
+        with open(self.db_path, "wb") as f:
+            f.write(b"SHORT")
+        db = KVDatabase(self.db_path)
+        self.assertEqual(db.check(), 0)
+        self.assertEqual(os.path.getsize(self.db_path), 16)
+
+        # 2. Zero-length value is allowed
+        db.put("empty_val_key", "")
+        self.assertEqual(db.get("empty_val_key"), b"")
+
+        # 3. Zero-length key raises ValueError
+        with self.assertRaises(ValueError):
+            db.put("", "some_val")
+        with self.assertRaises(ValueError):
+            db.delete("")
+        db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

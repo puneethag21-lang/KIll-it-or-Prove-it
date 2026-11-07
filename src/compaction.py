@@ -66,7 +66,7 @@ def compact_database(
                     # Calculate fixed overhead: 16B file header + 23B commit marker
                     overhead = 16 + 23
                     crit_bytes = sum(
-                        RECORD_HEADER_SIZE + len(k) + db.index[k][1] + CRC_SIZE
+                        RECORD_HEADER_SIZE + len(k) + (db.index[k][1] if isinstance(db.index[k], tuple) else (db.index[k] & 0xffffffff)) + CRC_SIZE
                         for k in crit_keys
                     )
                     remaining_budget = max(0, target_budget - overhead - crit_bytes)
@@ -75,7 +75,8 @@ def compact_database(
                     retained_non_crit = []
                     acc_bytes = 0
                     for k in reversed(non_crit_keys):
-                        entry_size = RECORD_HEADER_SIZE + len(k) + db.index[k][1] + CRC_SIZE
+                        vlen = db.index[k][1] if isinstance(db.index[k], tuple) else (db.index[k] & 0xffffffff)
+                        entry_size = RECORD_HEADER_SIZE + len(k) + vlen + CRC_SIZE
                         if acc_bytes + entry_size <= remaining_budget:
                             retained_non_crit.append(k)
                             acc_bytes += entry_size
@@ -92,7 +93,8 @@ def compact_database(
                 temp_f.write(encode_file_header())
 
                 for key in retained_keys:
-                    offset, length = db.index[key]
+                    loc = db.index[key]
+                    offset, length = loc if isinstance(loc, tuple) else (loc >> 32, loc & 0xffffffff)
                     db.file.seek(offset)
                     val = db.file.read(length)
                     rec = encode_record(TYPE_PUT, txid, key, val)
@@ -116,6 +118,10 @@ def compact_database(
             # Reopen and rebuild in-memory index
             db.file = open(db.path, "r+b")
             db._recover()
+            try:
+                db._save_index_checkpoint()
+            except Exception:
+                pass
 
             return len(retained_keys), pruned_count
 

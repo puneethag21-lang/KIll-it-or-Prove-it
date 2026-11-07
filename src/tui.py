@@ -382,6 +382,16 @@ class SynterraTUI:
                 )
                 self.last_output = ("success", msg)
 
+            elif cmd == "stats":
+                s = self.db.stats()
+                msg = (
+                    f"Live Keys:        {s['live_keys']}\n"
+                    f"Tombstones:       {s['tombstones']}\n"
+                    f"Total File Size:  {format_bytes(s['total_size'])} ({s['total_size']} bytes)\n"
+                    f"Reclaimable:      {format_bytes(s['reclaimable_bytes'])} ({s['reclaimable_bytes']} bytes)"
+                )
+                self.last_output = ("success", msg)
+
             elif cmd == "serve":
                 port = int(args[0]) if args and args[0].isdigit() else 8080
                 if self.http_server:

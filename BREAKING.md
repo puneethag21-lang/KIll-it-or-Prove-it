@@ -65,10 +65,10 @@ We acknowledge the following three genuine architectural weaknesses in our desig
 
 ## 5. If We Had 24 More Hours
 
-1. **Memory-Mapped (mmap) Read Path**:  
-   We would implement an `mmap`-backed reader for `get()` operations, allowing concurrent readers to read value bytes directly from shared memory pages without disk seeks or lock contention.
-2. **Periodic Checkpoint / Hint Index File**:  
-   To handle databases with > 10,000,000 keys, we would persist an immutable checkpoint index file (`.idx`) during compaction, reducing `open()` recovery time from 1.48 seconds to under 0.05 seconds regardless of log length.
+1. **Zero-Copy Native Overlapped / Async I/O**:  
+   We would integrate Windows `ReadFile`/`WriteFile` with `OVERLAPPED` events and Linux `io_uring` through ctypes, entirely bypassing kernel thread context switches during high-throughput ingest.
+2. **Read-Write Lock (RWLock) Splitting**:  
+   We would replace the coarse-grained process lock with a reader-writer lock (shared read lock, exclusive write lock), allowing unbounded concurrent readers to execute `get()` and `dump()` queries without blocking each other.
 3. **Background Auto-Compaction Daemon**:  
    We would implement an asynchronous background compaction thread that triggers copy-on-write compaction whenever deleted or overwritten keys exceed 30% of total log volume, completely automating file shrinkage.
 

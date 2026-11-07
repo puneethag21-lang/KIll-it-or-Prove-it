@@ -308,6 +308,17 @@ def main(argv=None):
         max_bytes = args.max_bytes if args.max_bytes > 0 else None
         run_serve(args.path, max_bytes=max_bytes)
 
+    elif args.command == "stats":
+        db = KVDatabase(args.path)
+        try:
+            s = db.stats()
+            print(f"live_keys: {s['live_keys']}")
+            print(f"tombstones: {s['tombstones']}")
+            print(f"total_size: {s['total_size']} bytes")
+            print(f"reclaimable: {s['reclaimable_bytes']} bytes")
+        finally:
+            db.close()
+
     elif args.command == "ui":
         from src.tui import run_tui
         run_tui(args.path)

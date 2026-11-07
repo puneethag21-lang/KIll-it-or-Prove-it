@@ -9,6 +9,7 @@ import zlib
 import hashlib
 import threading
 import gc
+import marshal
 from typing import List, Tuple, Optional, Dict, Union
 
 from src.format import (
@@ -28,6 +29,8 @@ from src.errors import (
 )
 
 FAST_HDR_STRUCT = struct.Struct("<4xB8xHI")
+IDX_HDR_STRUCT = struct.Struct("<8sIQII")
+IDX_MAGIC = b"KVIDX001"
 
 
 class KVDatabase:
@@ -45,11 +48,18 @@ class KVDatabase:
         # In-memory index: key (bytes) -> (value_offset, value_len)
         self.index: Dict[bytes, Tuple[int, int]] = {}
 
-        # 1. Clean up any leftover .compact file from a crash during compaction
+        # 1. Clean up any leftover .compact or .idx.tmp file from a crash during compaction
         compact_temp = self.path + ".compact"
         if os.path.exists(compact_temp):
             try:
                 os.remove(compact_temp)
+            except OSError:
+                pass
+
+        tmp_idx = self.path + ".idx.tmp"
+        if os.path.exists(tmp_idx):
+            try:
+                os.remove(tmp_idx)
             except OSError:
                 pass
 
@@ -76,14 +86,92 @@ class KVDatabase:
         if self.closed or self.file is None or self.file.closed:
             raise DatabaseClosedError("Database is closed")
 
+    def _save_index_checkpoint(self):
+        """
+        Writes a crash-safe binary index snapshot (<path>.idx)
+        protected by CRC32 to accelerate future opens.
+        """
+        if self.file is None or self.file.closed:
+            return
+        try:
+            self.file.seek(0, os.SEEK_END)
+            last_offset = self.file.tell()
+
+            dict_blob = marshal.dumps(self.index)
+            dict_crc = zlib.crc32(dict_blob) & 0xffffffff
+            blob_len = len(dict_blob)
+
+            hdr = IDX_HDR_STRUCT.pack(IDX_MAGIC, 1, last_offset, dict_crc, blob_len)
+            payload = hdr + dict_blob
+            total_crc = zlib.crc32(payload) & 0xffffffff
+            full_data = payload + CRC_STRUCT.pack(total_crc)
+
+            tmp_idx = self.path + ".idx.tmp"
+            with open(tmp_idx, "wb") as f:
+                f.write(full_data)
+                fsync_file(f)
+            os.replace(tmp_idx, self.path + ".idx")
+        except Exception:
+            pass
+
+    def _load_index_checkpoint(self, total_size: int) -> Optional[int]:
+        """
+        Attempts to load pre-packed index cache (<path>.idx).
+        Returns starting log offset for replaying delta records if valid, or None.
+        """
+        idx_path = self.path + ".idx"
+        if not os.path.exists(idx_path):
+            return None
+
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
+
+        try:
+            with open(idx_path, "rb") as f:
+                raw = f.read()
+            if len(raw) < 32:  # 28B header + 4B CRC
+                return None
+            body_end = len(raw) - 4
+            expected_crc = zlib.crc32(raw[:body_end]) & 0xffffffff
+            actual_crc = CRC_STRUCT.unpack_from(raw, body_end)[0]
+            if expected_crc != actual_crc:
+                return None
+
+            magic, ver, log_offset, dict_crc, blob_len = IDX_HDR_STRUCT.unpack_from(raw, 0)
+            if magic != IDX_MAGIC or ver != 1:
+                return None
+            if log_offset > total_size or log_offset < FILE_HEADER_SIZE:
+                return None
+            if 28 + blob_len != body_end:
+                return None
+
+            dict_blob = raw[28:body_end]
+
+            if log_offset > FILE_HEADER_SIZE:
+                self.file.seek(log_offset - 23)
+                commit_tail = self.file.read(23)
+                if len(commit_tail) != 23 or commit_tail[4] != 3:
+                    return None
+
+            self.index = marshal.loads(dict_blob)
+            return log_offset
+        except Exception:
+            self.index.clear()
+            return None
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
     def _recover(self):
         """
         Sub-second, crash-safe zero-copy recovery using memoryview and mmap:
         1. Validate 16-byte header.
-        2. Stream through log using mmap memoryview cursor on isolated read handle.
-        3. Buffer pending transaction ops per txid.
-        4. Apply ops to self.index ONLY when valid COMMIT is parsed.
-        5. Truncate file cleanly to the end of the LAST VALID COMMIT.
+        2. Attempt fast index checkpoint load if available and matching.
+        3. Stream through delta log using fast scanning.
+        4. Buffer pending transaction ops per txid.
+        5. Apply ops to self.index ONLY when valid COMMIT is parsed.
+        6. Truncate file cleanly to the end of the LAST VALID COMMIT.
         """
         self._ensure_open()
         self.index.clear()
@@ -106,6 +194,12 @@ class KVDatabase:
         if total_size == FILE_HEADER_SIZE:
             return
 
+        # Attempt immediate fast-path checkpoint recovery
+        loaded_offset = self._load_index_checkpoint(total_size)
+        if loaded_offset is not None and loaded_offset == total_size:
+            self.file.seek(0, os.SEEK_END)
+            return
+
         gc_was_enabled = gc.isenabled()
         if gc_was_enabled:
             gc.disable()
@@ -118,6 +212,13 @@ class KVDatabase:
             if total_size <= FILE_HEADER_SIZE:
                 return
 
+            if loaded_offset is not None:
+                pos = loaded_offset
+                last_commit_end = loaded_offset
+            else:
+                pos = FILE_HEADER_SIZE
+                last_commit_end = FILE_HEADER_SIZE
+
             limit = total_size - 22
             unpack_fast = FAST_HDR_STRUCT.unpack_from
             calc_crc = zlib.crc32
@@ -127,18 +228,15 @@ class KVDatabase:
             set_fn = index.__setitem__
             pop_fn = index.pop
 
-            pos = FILE_HEADER_SIZE
-            last_commit_end = FILE_HEADER_SIZE
-
             # Tail CRC threshold: check CRC on last records (approx 200KB or 5,000 records)
-            tail_crc_threshold = max(FILE_HEADER_SIZE, total_size - 200000)
+            tail_crc_threshold = max(pos, total_size - 200000)
 
             # Stage 1: Fast scan through bulk committed history
             while pos < tail_crc_threshold:
                 tp, kl, vl = unpack_fast(data, pos)
                 if tp == 1:
                     ke = pos + 19 + kl
-                    set_fn(data[pos + 19 : ke], (ke, vl))
+                    set_fn(data[pos + 19 : ke], (ke << 32) | vl)
                     pos = ke + vl + 4
                 elif tp == 3:
                     pos += 23
@@ -165,7 +263,7 @@ class KVDatabase:
 
                 if tp == 1:
                     ke = pos + 19 + kl
-                    set_fn(data[pos + 19 : ke], (ke, vl))
+                    set_fn(data[pos + 19 : ke], (ke << 32) | vl)
                     pos = ke + vl + 4
                 elif tp == 3:
                     pos += 23
@@ -279,7 +377,7 @@ class KVDatabase:
                 # 4. Update in-memory index only after fsync succeeds
                 for rec_type, k_b, val_offset, val_len in op_offsets:
                     if rec_type == TYPE_PUT:
-                        self.index[k_b] = (val_offset, val_len)
+                        self.index[k_b] = (val_offset << 32) | val_len
                     elif rec_type == TYPE_DELETE:
                         self.index.pop(k_b, None)
 
@@ -304,14 +402,16 @@ class KVDatabase:
             if key_b not in self.index:
                 return None
 
-            offset, length = self.index[key_b]
+            loc = self.index[key_b]
+            offset, length = loc if isinstance(loc, tuple) else (loc >> 32, loc & 0xffffffff)
             self.file.seek(offset)
             return self.file.read(length)
 
     def _compute_audit_hash_locked(self) -> str:
         h = hashlib.sha256()
         for k in sorted(self.index.keys()):
-            offset, length = self.index[k]
+            loc = self.index[k]
+            offset, length = loc if isinstance(loc, tuple) else (loc >> 32, loc & 0xffffffff)
             self.file.seek(offset)
             val = self.file.read(length)
             entry = struct.pack(">IH", len(k), len(val)) + k + val
@@ -352,7 +452,8 @@ class KVDatabase:
             self._ensure_open()
             results = []
             for k in sorted(self.index.keys()):
-                offset, length = self.index[k]
+                loc = self.index[k]
+                offset, length = loc if isinstance(loc, tuple) else (loc >> 32, loc & 0xffffffff)
                 self.file.seek(offset)
                 val = self.file.read(length)
                 results.append((k, val))
@@ -400,8 +501,8 @@ class KVDatabase:
                 else:
                     overhead = FILE_HEADER_SIZE + 23
                     active_records = sum(
-                        RECORD_HEADER_SIZE + len(k) + vlen + CRC_SIZE
-                        for k, (offset, vlen) in self.index.items()
+                        RECORD_HEADER_SIZE + len(k) + (loc[1] if isinstance(loc, tuple) else (loc & 0xffffffff)) + CRC_SIZE
+                        for k, loc in self.index.items()
                     )
                     active_size = overhead + active_records
 
@@ -433,6 +534,10 @@ class KVDatabase:
             if not self.closed:
                 self.closed = True
                 if self.file is not None and not self.file.closed:
+                    try:
+                        self._save_index_checkpoint()
+                    except Exception:
+                        pass
                     try:
                         fsync_file(self.file)
                     except OSError:

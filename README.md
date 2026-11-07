@@ -82,18 +82,29 @@ Outputs all live keys and values in the database sorted lexicographically by key
 Verifies structural log integrity, validates headers, and reports active key count.
 ```bash
 ./kvdb check database.kv
-# Output: OK: 3 keys
+# Output: OK
 ```
 
 ### 8. `serve`
 Long-running daemon mode that reads instructions from `stdin` and writes `ACK <op-id>` to `stdout` strictly after physical `fsync`. Used by the torture tool and live demo crash testing.
 ```bash
-./kvdb serve database.kv
+./kvdb serve database.kv [--max-bytes 50000000]
 # Input:  op101 put greeting hello
 # Output: ACK op101
 ```
 
-### 9. `compact` (Maintenance)
+### 9. `stats` (Observability)
+Reports live key count, tombstone count, total on-disk size, and space reclaimable via compaction.
+```bash
+./kvdb stats database.kv
+# Output:
+# live_keys: 1000
+# tombstones: 250
+# total_size: 45000 bytes
+# reclaimable: 12500 bytes
+```
+
+### 10. `compact` (Maintenance)
 Triggers crash-safe copy-on-write compaction, purging deleted/overwritten keys and reclaiming disk space.
 ```bash
 ./kvdb compact database.kv
