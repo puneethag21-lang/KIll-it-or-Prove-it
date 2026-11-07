@@ -449,3 +449,4 @@ def run_tui(db_path: str = "synterra.kv"):
 if __name__ == "__main__":
     db_file = sys.argv[1] if len(sys.argv) > 1 else "synterra.kv"
     run_tui(db_file)
+

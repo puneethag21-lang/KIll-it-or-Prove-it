@@ -358,6 +358,62 @@ class KVDatabase:
                 results.append((k, val))
             return results
 
+    def stats(self) -> Dict[str, Union[int, float]]:
+        """
+        Calculates storage statistics:
+        - live key count
+        - tombstone count
+        - total file size
+        - space reclaimable via compaction
+        """
+        self._ensure_open()
+        with self.lock:
+            with file_lock(self.lock_file):
+                self._ensure_open()
+                total_size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
+                live_keys = len(self.index)
+
+                tombstone_count = 0
+                if total_size > FILE_HEADER_SIZE:
+                    try:
+                        with open(self.path, "rb") as f:
+                            data = f.read()
+                        pos = FILE_HEADER_SIZE
+                        unpack_fast = FAST_HDR_STRUCT.unpack_from
+                        limit = len(data) - 22
+                        while pos <= limit:
+                            tp, kl, vl = unpack_fast(data, pos)
+                            if tp == 2:  # TYPE_DELETE
+                                tombstone_count += 1
+                                pos += 23 + kl
+                            elif tp == 1:  # TYPE_PUT
+                                pos += 23 + kl + vl
+                            elif tp == 3:  # TYPE_COMMIT
+                                pos += 23
+                            else:
+                                break
+                    except Exception:
+                        pass
+
+                if live_keys == 0:
+                    active_size = FILE_HEADER_SIZE
+                else:
+                    overhead = FILE_HEADER_SIZE + 23
+                    active_records = sum(
+                        RECORD_HEADER_SIZE + len(k) + vlen + CRC_SIZE
+                        for k, (offset, vlen) in self.index.items()
+                    )
+                    active_size = overhead + active_records
+
+                reclaimable_bytes = max(0, total_size - active_size)
+
+                return {
+                    "live_keys": live_keys,
+                    "tombstones": tombstone_count,
+                    "total_size": total_size,
+                    "reclaimable_bytes": reclaimable_bytes,
+                }
+
     def compact(self, priority_retention: bool = False, target_max_bytes: Optional[int] = None):
         """
         Crash-safe database compaction:

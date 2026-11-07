@@ -206,6 +206,10 @@ def main(argv=None):
     p_compact.add_argument("--priority-retention", action="store_true", help="Preserve crit: tags while pruning older telemetry")
     p_compact.add_argument("--target-bytes", type=int, default=None, help="Target storage budget in bytes")
 
+    # Observability: stats <path>
+    p_stats = subparsers.add_parser("stats", help="Show database storage statistics")
+    p_stats.add_argument("path", help="Database file path")
+
     args = parser.parse_args(argv)
 
     if args.command == "open":
