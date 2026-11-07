@@ -118,10 +118,6 @@ def compact_database(
             # Reopen and rebuild in-memory index
             db.file = open(db.path, "r+b")
             db._recover()
-            try:
-                db._save_index_checkpoint()
-            except Exception:
-                pass
 
             return len(retained_keys), pruned_count
 

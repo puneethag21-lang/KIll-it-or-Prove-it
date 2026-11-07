@@ -1,9 +1,9 @@
 """
 Official 1,000,000-Key Recovery Benchmark for Synterra KVDB.
 Directives:
-1. Test raw un-checkpointed recovery (hard kill -9 after 1,000,000 records).
-2. Test checkpoint-accelerated recovery.
-3. Assert recovery time < 0.50s (0.40s - 0.49s).
+1. Test raw single-file log recovery (hard kill -9 after 1,000,000 records).
+2. Assert strict single-file compliance (no .idx sidecar file on disk).
+3. Assert recovery time < 2.0s (Section 5, Scenario F3).
 """
 
 import os
@@ -62,14 +62,12 @@ class Test1MKeyBenchmark(unittest.TestCase):
         db.lock_file.close()
         db.closed = True
 
-        # Ensure NO .idx cache exists
-        idx_path = self.db_path + ".idx"
-        if os.path.exists(idx_path):
-            os.remove(idx_path)
-        self.assertFalse(os.path.exists(idx_path))
+        # Strict Single-File Check: only bench_1m.kv and optional bench_1m.kv.lock exist
+        data_files = [f for f in os.listdir(self.temp_dir.name) if not f.endswith(".lock")]
+        self.assertEqual(data_files, ["bench_1m.kv"], "Strict single-file violation: unexpected files found on disk!")
 
-        # 1. RAW UN-CHECKPOINTED RECOVERY BENCHMARK
-        print("\n[BENCHMARK 1] Executing RAW UN-CHECKPOINTED log recovery (Cold Start)...")
+        # 1. RAW UN-CHECKPOINTED SINGLE-FILE RECOVERY BENCHMARK (Scenario F3)
+        print("\n[BENCHMARK] Executing RAW SINGLE-FILE log recovery (Cold Start after kill -9)...")
         t0 = time.perf_counter()
         db_recovered = KVDatabase(self.db_path)
         t1 = time.perf_counter()
@@ -81,25 +79,11 @@ class Test1MKeyBenchmark(unittest.TestCase):
         self.assertEqual(len(db_recovered.index), total_keys)
         self.assertLess(raw_recovery_time, 2.0, "Recovery exceeded PDF 2.0s boundary!")
 
-        # Clean close to write checkpoint
         db_recovered.close()
-        self.assertTrue(os.path.exists(idx_path))
 
-        # 2. CHECKPOINTED RECOVERY BENCHMARK
-        print("\n[BENCHMARK 2] Executing CHECKPOINT-ACCELERATED log recovery...")
-        chk_times = []
-        for i in range(3):
-            t2 = time.perf_counter()
-            db_fast = KVDatabase(self.db_path)
-            t3 = time.perf_counter()
-            chk_times.append(t3 - t2)
-            self.assertEqual(len(db_fast.index), total_keys)
-            db_fast.close()
-
-        best_chk = min(chk_times)
-        print(f"--> CHECKPOINT RECOVERY TIME (Best of 3): {best_chk:.4f}s (Runs: {[f'{t:.4f}s' for t in chk_times]})")
-        print(f"--> Active keys recovered: {total_keys:,}")
-        self.assertLess(best_chk, 0.50, f"Checkpoint recovery exceeded 0.50s target: {best_chk:.4f}s")
+        # Re-verify that after close(), STILL only the single .kv file exists!
+        data_files_after = [f for f in os.listdir(self.temp_dir.name) if not f.endswith(".lock")]
+        self.assertEqual(data_files_after, ["bench_1m.kv"], "Single-file invariant violated after close()!")
         print("=======================================================\n")
 
 

@@ -9,7 +9,6 @@ import zlib
 import hashlib
 import threading
 import gc
-import marshal
 from typing import List, Tuple, Optional, Dict, Union
 
 from src.format import (
@@ -29,8 +28,6 @@ from src.errors import (
 )
 
 FAST_HDR_STRUCT = struct.Struct("<4xB8xHI")
-IDX_HDR_STRUCT = struct.Struct("<8sIQII")
-IDX_MAGIC = b"KVIDX001"
 
 
 class KVDatabase:
@@ -45,21 +42,14 @@ class KVDatabase:
         self.lock = threading.RLock()
         self.closed = False
 
-        # In-memory index: key (bytes) -> (value_offset, value_len)
-        self.index: Dict[bytes, Tuple[int, int]] = {}
+        # In-memory index: key (bytes) -> packed int (value_offset << 32) | value_len
+        self.index: Dict[bytes, int] = {}
 
-        # 1. Clean up any leftover .compact or .idx.tmp file from a crash during compaction
+        # 1. Clean up any leftover .compact file from a crash during compaction
         compact_temp = self.path + ".compact"
         if os.path.exists(compact_temp):
             try:
                 os.remove(compact_temp)
-            except OSError:
-                pass
-
-        tmp_idx = self.path + ".idx.tmp"
-        if os.path.exists(tmp_idx):
-            try:
-                os.remove(tmp_idx)
             except OSError:
                 pass
 
@@ -86,92 +76,14 @@ class KVDatabase:
         if self.closed or self.file is None or self.file.closed:
             raise DatabaseClosedError("Database is closed")
 
-    def _save_index_checkpoint(self):
-        """
-        Writes a crash-safe binary index snapshot (<path>.idx)
-        protected by CRC32 to accelerate future opens.
-        """
-        if self.file is None or self.file.closed:
-            return
-        try:
-            self.file.seek(0, os.SEEK_END)
-            last_offset = self.file.tell()
-
-            dict_blob = marshal.dumps(self.index)
-            dict_crc = zlib.crc32(dict_blob) & 0xffffffff
-            blob_len = len(dict_blob)
-
-            hdr = IDX_HDR_STRUCT.pack(IDX_MAGIC, 1, last_offset, dict_crc, blob_len)
-            payload = hdr + dict_blob
-            total_crc = zlib.crc32(payload) & 0xffffffff
-            full_data = payload + CRC_STRUCT.pack(total_crc)
-
-            tmp_idx = self.path + ".idx.tmp"
-            with open(tmp_idx, "wb") as f:
-                f.write(full_data)
-                fsync_file(f)
-            os.replace(tmp_idx, self.path + ".idx")
-        except Exception:
-            pass
-
-    def _load_index_checkpoint(self, total_size: int) -> Optional[int]:
-        """
-        Attempts to load pre-packed index cache (<path>.idx).
-        Returns starting log offset for replaying delta records if valid, or None.
-        """
-        idx_path = self.path + ".idx"
-        if not os.path.exists(idx_path):
-            return None
-
-        gc_was_enabled = gc.isenabled()
-        if gc_was_enabled:
-            gc.disable()
-
-        try:
-            with open(idx_path, "rb") as f:
-                raw = f.read()
-            if len(raw) < 32:  # 28B header + 4B CRC
-                return None
-            body_end = len(raw) - 4
-            expected_crc = zlib.crc32(raw[:body_end]) & 0xffffffff
-            actual_crc = CRC_STRUCT.unpack_from(raw, body_end)[0]
-            if expected_crc != actual_crc:
-                return None
-
-            magic, ver, log_offset, dict_crc, blob_len = IDX_HDR_STRUCT.unpack_from(raw, 0)
-            if magic != IDX_MAGIC or ver != 1:
-                return None
-            if log_offset > total_size or log_offset < FILE_HEADER_SIZE:
-                return None
-            if 28 + blob_len != body_end:
-                return None
-
-            dict_blob = raw[28:body_end]
-
-            if log_offset > FILE_HEADER_SIZE:
-                self.file.seek(log_offset - 23)
-                commit_tail = self.file.read(23)
-                if len(commit_tail) != 23 or commit_tail[4] != 3:
-                    return None
-
-            self.index = marshal.loads(dict_blob)
-            return log_offset
-        except Exception:
-            self.index.clear()
-            return None
-        finally:
-            if gc_was_enabled:
-                gc.enable()
-
     def _recover(self):
         """
-        Sub-second, crash-safe zero-copy recovery using memoryview and mmap:
+        Sub-second, crash-safe zero-copy recovery using memoryview and fast scanning:
         1. Validate 16-byte header.
-        2. Attempt fast index checkpoint load if available and matching.
-        3. Stream through delta log using fast scanning.
-        4. Buffer pending transaction ops per txid.
-        5. Apply ops to self.index ONLY when valid COMMIT is parsed.
-        6. Truncate file cleanly to the end of the LAST VALID COMMIT.
+        2. Stream through log using fast scanning.
+        3. Buffer pending transaction ops per txid.
+        4. Apply ops to self.index ONLY when valid COMMIT is parsed.
+        5. Truncate file cleanly to the end of the LAST VALID COMMIT.
         """
         self._ensure_open()
         self.index.clear()
@@ -194,12 +106,6 @@ class KVDatabase:
         if total_size == FILE_HEADER_SIZE:
             return
 
-        # Attempt immediate fast-path checkpoint recovery
-        loaded_offset = self._load_index_checkpoint(total_size)
-        if loaded_offset is not None and loaded_offset == total_size:
-            self.file.seek(0, os.SEEK_END)
-            return
-
         gc_was_enabled = gc.isenabled()
         if gc_was_enabled:
             gc.disable()
@@ -212,12 +118,8 @@ class KVDatabase:
             if total_size <= FILE_HEADER_SIZE:
                 return
 
-            if loaded_offset is not None:
-                pos = loaded_offset
-                last_commit_end = loaded_offset
-            else:
-                pos = FILE_HEADER_SIZE
-                last_commit_end = FILE_HEADER_SIZE
+            pos = FILE_HEADER_SIZE
+            last_commit_end = FILE_HEADER_SIZE
 
             limit = total_size - 22
             unpack_fast = FAST_HDR_STRUCT.unpack_from
@@ -534,10 +436,6 @@ class KVDatabase:
             if not self.closed:
                 self.closed = True
                 if self.file is not None and not self.file.closed:
-                    try:
-                        self._save_index_checkpoint()
-                    except Exception:
-                        pass
                     try:
                         fsync_file(self.file)
                     except OSError:
